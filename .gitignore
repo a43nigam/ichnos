@@ -1,0 +1,6 @@
+/target/
+/data/
+/.tmp/
+/.Rhistory
+/.DS_Store
+*.log

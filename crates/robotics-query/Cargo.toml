@@ -1,0 +1,17 @@
+[package]
+name = "robotics-query"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+object_store = { version = "0.13.2", features = ["aws"] }
+robotics-core = { path = "../robotics-core" }
+url = "2.5.8"
+
+[dev-dependencies]
+robotics-catalog = { path = "../robotics-catalog" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }

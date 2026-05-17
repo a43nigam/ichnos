@@ -1,0 +1,15 @@
+[package]
+name = "robotics-catalog"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+parquet = "58.3.0"
+robotics-core = { path = "../robotics-core" }
+
+[dev-dependencies]
+robotics-ingest = { path = "../robotics-ingest" }

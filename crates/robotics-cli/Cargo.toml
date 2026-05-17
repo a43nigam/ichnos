@@ -1,0 +1,21 @@
+[package]
+name = "robotics-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "robotics"
+path = "src/main.rs"
+
+[dependencies]
+robotics-catalog = { path = "../robotics-catalog" }
+robotics-core = { path = "../robotics-core" }
+robotics-ingest = { path = "../robotics-ingest" }
+robotics-query = { path = "../robotics-query" }
+robotics-tensor = { path = "../robotics-tensor" }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+
