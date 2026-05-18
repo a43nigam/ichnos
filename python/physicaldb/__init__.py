@@ -1,3 +1,21 @@
-from .query import EgressLimitError, QueryResult, query
+from .query import (
+    CorrectnessReport,
+    EgressLimitError,
+    QueryResult,
+    RowGroupSpan,
+    SeekPlan,
+    TemporalGapError,
+    plan,
+    query,
+)
 
-__all__ = ["EgressLimitError", "QueryResult", "query"]
+__all__ = [
+    "CorrectnessReport",
+    "EgressLimitError",
+    "QueryResult",
+    "RowGroupSpan",
+    "SeekPlan",
+    "TemporalGapError",
+    "plan",
+    "query",
+]
