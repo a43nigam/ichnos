@@ -3,6 +3,187 @@
 ## Goal
 Build a Rust-first robotics data query engine that indexes robotics sessions, prunes candidate row groups, performs byte-accounted reads, and returns uniformly sampled tensor-shaped windows for model training and evaluation.
 
+Here is the original tech spec:
+
+# Product Definition
+
+You are building a **behavioral query engine for physical AI data**. The core value proposition is simple: given petabytes of raw robotics logs sitting in cold cloud storage, an engineer can describe a physical event and receive a training-ready tensor back in seconds, without downloading or preprocessing anything.
+
+Phase 2 is the product. Phase 3 is the interface that makes it feel real. Phase 1 is the necessary plumbing underneath.
+
+The customer is an ML engineer at a Series A-C robotics or physical AI startup that is generating serious log volume but doesn't have a dedicated data platform team. They are currently either writing brittle custom parsers, downloading entire files to find one event, or both.
+
+---
+
+# Full Engineering Specification
+
+## Module 1: Ingestion & Columnar Storage
+
+### Objective
+Convert raw multi-modal log files into a queryable, optimized Parquet layout on S3. This runs once per log file, either at upload time or on a scheduled batch.
+
+### Inputs
+- MCAP, ROS2 bag, Protobuf, raw Parquet
+- Delivered via local disk, S3 upload, or network socket
+
+### Data Schema
+
+| Entity | Column Name | Physical Type | Encoding |
+|---|---|---|---|
+| Timestamp | `ts_ns` | Int64 | Nanoseconds since Unix epoch, UTC |
+| Position | `pos_xyz` | FixedSizeList(Float64, 3) | Contiguous x,y,z array |
+| Orientation | `rot_wxyz` | FixedSizeList(Float64, 4) | Normalized quaternion |
+| Rigid Transform | `transform_4x4` | FixedSizeList(Float64, 16) | Row-major SE(3) matrix |
+| LiDAR | `lidar_geometry` | GeoArrow.point / WKB | Native Parquet geometry type |
+| Camera | `camera_bytes` | LargeBinary | Sharded, inline-compressed chunks |
+| IMU | `imu_accel`, `imu_gyro` | FixedSizeList(Float64, 3) | Scalar high-frequency columns |
+
+### Architecture
+- **Ingestion Daemon:** Multithreaded Rust parser. Stream-reads chunks from disk or socket. Never loads full file into memory.
+- **Schema Evolution Handler:** Detects mid-session sensor driver renames and merges via Arrow schema evolution without breaking write path.
+- **Null Frame Handler:** Dropped or malformed frames written as explicit Arrow bitmask nulls. Never silently skipped.
+- **Columnar Writer:** Partitions row groups by modality. High-frequency scalar streams (IMU, joints) and low-frequency high-bandwidth streams (LiDAR, camera) written to decoupled column blocks to maximize downstream read-skipping.
+
+### Output
+Partitioned Parquet files on S3, organized as:
+```
+s3://bucket/fleet/{robot_id}/{date}/{session_id}/
+    scalars.parquet        # IMU, joints, kinematics
+    geometry.parquet       # LiDAR point clouds
+    video.parquet          # Camera byte buffers
+    metadata.parquet       # Session-level index entry
+```
+
+### Definition of Done
+- Ingest a 10GB MCAP file containing unaligned video, LiDAR, and 400Hz IMU
+- Output valid, compressed, GeoArrow-compliant Parquet files
+- Zero full-file memory loads during ingestion
+
+---
+
+## Module 2: Metadata Index & Seek Engine
+
+### Objective
+Build and maintain a lightweight behavioral index over all ingested sessions. Execute spatial, temporal, and kinematic queries directly against this index to identify matching byte offsets in S3, then stream only those bytes.
+
+### Index Structure
+Each ingested session produces one metadata record containing:
+- `robot_id`, `session_id`, `start_ts`, `end_ts`
+- Bounding box of full trajectory (min/max x, y, z)
+- Per-row-group: byte offset, start/end timestamp, spatial bounding box, min/max velocity magnitude
+- Explicit temporal gap markers where telemetry was lost
+
+This catalog is stored as a small, always-hot Parquet file (or DuckDB database file) — never exceeding a few GB even across thousands of hours of logs.
+
+### Query Engine Architecture
+```
+[ Python Query API ]
+        │
+        ▼
+[ DuckDB Query Optimizer ]
+        │
+  (MobilityDuck Extension)
+        │
+        ▼
+[ Spatial-Temporal Metadata Catalog ]
+    (R-Tree / Hilbert Curve Index)
+        │
+   ┌────┴────┐
+   ▼         ▼
+[Matching   [Irrelevant
+Row Groups] Row Groups
+            PRUNED]
+        │
+        ▼
+[ HTTP Range-GET → S3 ]
+  (Matching bytes only)
+```
+
+### Query Predicate Support
+```sql
+SELECT file_path, row_group_id, byte_offset, start_time, end_time
+FROM fleet_metadata_catalog
+WHERE robot_id = 'humanoid_04'
+  AND duration(joint_trajectory, 'seconds') > 5
+  AND ST_Within(base_link_position, ST_MakeEnvelope(0, 0, 10, 10))
+  AND velocity_magnitude > 5.0
+```
+
+Supported predicate types:
+- Robot / session / date filters
+- Spatial: `ST_Within`, `ST_Intersects`, bounding box
+- Temporal: duration, time range, gap exclusion
+- Kinematic: velocity magnitude, acceleration thresholds, joint angle ranges
+
+### Critical Constraints
+- **Egress safety gate:** Scalar metadata columns are always evaluated before any byte-range requests are authorized against camera or LiDAR columns. A query that would pull >N GB of imagery must warn or block before execution.
+- **Temporal gap honesty:** Gaps in telemetry are explicit index entries. Queries never interpolate across a gap silently.
+- **Cold file, zero download:** The engine must be able to identify and return a 3-second window from a 500GB S3 file using only HTTP range requests against known byte offsets.
+
+### Definition of Done
+- Sub-millisecond query execution against an index representing 1,000+ hours of sessions
+- Successful extraction of a 3-second window from a cold S3 file without downloading surrounding data
+- Egress gate correctly blocks an overly broad imagery query before any bytes are streamed
+
+---
+
+## Module 3: Kinematic Interpolation & Tensor Bridge
+
+### Objective
+Take the raw columnar byte ranges returned by Module 2 and materialize them as a perfectly time-aligned, resampled, multi-channel PyTorch tensor. Zero memory copy. No preprocessing by the caller.
+
+### Interpolation Logic
+
+**Scalar / Translation (Linear)**
+Standard linear interpolation between the two bounding raw samples at the requested timestamp.
+
+**Orientation (Slerp)**
+Quaternions are interpolated spherically across the 4D unit hypersphere. Before each Slerp step, the kernel evaluates `q1 · q2`. If the dot product is negative, the target quaternion is negated to guarantee shortest-path interpolation and prevent rotational jitter.
+
+**Resampling Controller**
+Accepts a target frequency from the caller (e.g., 30Hz). Aligns all input channels — regardless of their native sample rates — onto a uniform output timeline. A 400Hz IMU and a 12Hz positional tracker both land on the same 30Hz frame matrix.
+
+### Tensor Bridge
+- Output is a `torch.Tensor` delivered via DLPack or direct pointer memory mapping
+- The Arrow table produced by interpolation is mapped directly into PyTorch memory space
+- Zero RAM duplication: verified by memory profiling that no copy occurs during the Arrow → Tensor transition
+
+### API Surface (Python)
+```python
+from physicaldb import query
+
+tensor = query(
+    robot_id="humanoid_04",
+    predicate="velocity_magnitude > 5.0 AND ST_Within(position, zone_A)",
+    channels=["pos_xyz", "rot_wxyz", "imu_accel"],
+    target_hz=30,
+    output="torch"
+)
+# Returns: torch.Tensor, shape [T, C]
+```
+
+### Critical Constraints
+- **Extrapolation rejection:** If the requested window extends beyond the bounds of a recording, the kernel throws an explicit extrapolation error. It never guesses.
+- **Quaternion inversion:** Enforced on every Slerp step, not optional.
+- **No caller preprocessing:** The tensor returned is immediately usable in a training loop. Shape, dtype, and alignment are guaranteed.
+
+### Definition of Done
+- Single Python call returns a synchronized multi-channel tensor from unaligned raw logs
+- Memory profiler confirms zero-copy transition from Arrow to PyTorch
+- Extrapolation boundary correctly raises an error rather than returning fabricated data
+
+---
+
+## Build Order Recommendation
+
+**Start with Module 2.** Build a minimal DuckDB-backed metadata catalog that can index pre-processed Parquet files and execute byte-range queries against S3. This is your core defensible technology and your demo.
+
+**Then Module 3.** Wire the byte ranges from Module 2 into a Python interpolation layer that outputs a tensor. This completes the demo loop — one query call, one tensor back.
+
+**Then Module 1.** Once you have paying customers or serious pilots, build the ingestion daemon properly so customers can onboard their own raw logs. Initially you can accept pre-converted Parquet manually or write a quick-and-dirty Python converter just to unblock pilots.
+
+This order gets you to a convincing, defensible demo fastest, without spending months on ingestion infrastructure before you've validated that anyone will pay for the query layer.
+
 ## Current Status
 | Area | Status | Notes |
 | --- | --- | --- |
