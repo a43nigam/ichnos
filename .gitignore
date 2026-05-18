@@ -2,5 +2,7 @@
 /data/
 /.tmp/
 /.Rhistory
+/.pytest_cache/
 /.DS_Store
+__pycache__/
 *.log

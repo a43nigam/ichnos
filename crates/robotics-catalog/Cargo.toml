@@ -8,7 +8,9 @@ version.workspace = true
 workspace = true
 
 [dependencies]
-parquet = "58.3.0"
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
+parquet = { version = "58.3.0", features = ["arrow"] }
 robotics-core = { path = "../robotics-core" }
 
 [dev-dependencies]

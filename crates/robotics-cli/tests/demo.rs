@@ -134,3 +134,98 @@ fn demo_command_runs_parquet_e2e() {
     std::fs::remove_file(values_path).ok();
     std::fs::remove_file(timestamps_path).ok();
 }
+
+#[test]
+fn catalog_build_and_tensor_command_run() {
+    let source = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_source.parquet",
+        std::process::id()
+    ));
+    let catalog = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_catalog.parquet",
+        std::process::id()
+    ));
+    let tensor_prefix =
+        std::env::temp_dir().join(format!("robotics_cli_{}_query_tensor", std::process::id()));
+
+    write_synthetic_parquet(
+        &source,
+        "humanoid_01",
+        "session_cli",
+        SyntheticConfig {
+            hz: 50.0,
+            duration_ns: 1_000_000_000,
+            start_ts_ns: 0,
+        },
+        25,
+    )
+    .unwrap();
+    let catalog_output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "catalog",
+            "build",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--out",
+            catalog.to_str().expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("catalog build should run");
+
+    assert!(
+        catalog_output.status.success(),
+        "catalog build failed: {}",
+        String::from_utf8_lossy(&catalog_output.stderr)
+    );
+    assert!(std::fs::metadata(&catalog).unwrap().len() > 0);
+
+    let tensor_output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "tensor",
+            "parquet-row-groups",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--row-groups",
+            "0",
+            "--start-ts-ns",
+            "0",
+            "--end-ts-ns",
+            "480000000",
+            "--hz",
+            "30",
+            "--out",
+            tensor_prefix
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("tensor command should run");
+
+    assert!(
+        tensor_output.status.success(),
+        "tensor command failed: {}",
+        String::from_utf8_lossy(&tensor_output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&tensor_output.stdout);
+    assert!(stdout.contains("tensor_shape=[15, 10]"));
+
+    let values_path = tensor_prefix.with_file_name(format!(
+        "{}.values.npy",
+        tensor_prefix.file_name().unwrap().to_string_lossy()
+    ));
+    let timestamps_path = tensor_prefix.with_file_name(format!(
+        "{}.timestamps_ns.npy",
+        tensor_prefix.file_name().unwrap().to_string_lossy()
+    ));
+    assert!(std::fs::read(&values_path)
+        .unwrap()
+        .starts_with(b"\x93NUMPY"));
+    assert!(std::fs::read(&timestamps_path)
+        .unwrap()
+        .starts_with(b"\x93NUMPY"));
+
+    std::fs::remove_file(source).ok();
+    std::fs::remove_file(catalog).ok();
+    std::fs::remove_file(values_path).ok();
+    std::fs::remove_file(timestamps_path).ok();
+}

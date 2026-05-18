@@ -1544,6 +1544,8 @@ dependencies = [
 name = "robotics-catalog"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-schema",
  "parquet",
  "robotics-core",
  "robotics-ingest",

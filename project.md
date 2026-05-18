@@ -12,7 +12,8 @@ Build a Rust-first robotics data query engine that indexes robotics sessions, pr
 | Tensorization | Done for M4 | Quaternion slerp, resampling, tensor-shaped buffers, extrapolation checks, selected Parquet row-group loading, and NumPy `.npy` export implemented. |
 | Dataset ingestion | In progress | Synthetic pose, synthetic Parquet, JSON-pose MCAP, ROS pose MCAP, KITTI raw OXTS, and nuScenes ego-pose ingestion implemented; richer public-dataset calibration adapters remain. |
 | Arrow/Parquet/S3 | Done for M2 | Arrow/Parquet, object-store range-read plumbing, S3 URI parsing, and live MinIO validation are implemented. |
-| Demo loop | Done for synthetic M4 | `robotics demo` now runs synthetic ingest -> Parquet index -> velocity/bbox catalog query -> byte-accounted row-group range read -> tensorization. |
+| DuckDB/Python facade | Prototype complete for pose | Rust can write a hot metadata catalog Parquet file; Python `physicaldb.query()` uses DuckDB to prune row groups, enforces an egress byte gate, and returns NumPy/PyTorch-shaped tensors through the Rust row-group tensor path. |
+| Demo loop | Done for synthetic M4 | `robotics demo` now runs synthetic ingest -> Parquet index -> velocity/bbox catalog query -> byte-accounted row-group range read -> tensorization; `physicaldb.query()` provides the product-shaped Python path. |
 
 ## Roadmap
 1. **M0: Compiling Rust core**
@@ -38,7 +39,7 @@ Build a Rust-first robotics data query engine that indexes robotics sessions, pr
    - Ingest one public/synthetic session.
    - Query velocity/bounding-box behavior.
    - Return `[T, C]` output and report row groups matched, bytes read, and wall-clock time.
-   - Status: complete for synthetic Parquet sessions, including tensor loading from selected row groups and optional NumPy export for Python/PyTorch loading.
+   - Status: complete for synthetic Parquet sessions, including tensor loading from selected row groups, hot catalog Parquet output, and Python/DuckDB query facade with optional NumPy/PyTorch loading.
 
 ## Canonical Data Model
 Sensor rows use nanosecond timestamps, `robot_id`, `session_id`, pose position, quaternion orientation, and linear velocity. Catalog rows summarize row-group/session windows with min/max timestamps, bounding boxes, velocity range, URI, row-group id, byte offset, and byte length.
@@ -50,14 +51,17 @@ Sensor rows use nanosecond timestamps, `robot_id`, `session_id`, pose position, 
 
 ## Validation Log
 - `cargo fmt --check`: passing.
-- `cargo test`: passing, 24 tests.
+- `cargo test`: passing, 26 Rust tests.
 - `cargo clippy --all-targets -- -D warnings`: passing.
+- `PYTHONPATH=python python3 -m pytest tests/test_physicaldb.py`: passing, 2 Python tests with DuckDB 1.5.2.
 - `cargo run -p robotics-cli -- demo fake`: matched 1 synthetic window, planned 1 range read, selected 65,536 bytes, returned tensor shape `[31, 10]`.
 - `cargo run -p robotics-cli -- demo`: wrote 3 synthetic Parquet row groups, indexed 3 row groups, applied default velocity/bbox predicates, matched 1 window `[0, 480000000]` ns, executed 1 range read, transferred 1,551 bytes from an 11,253 byte Parquet file, loaded 25 tensor source rows from the selected row group, returned tensor shape `[15, 10]`.
 - `cargo run -p robotics-cli -- demo --tensor-out data/tensor/demo`: wrote `data/tensor/demo.values.npy` with shape `[15, 10]` and `data/tensor/demo.timestamps_ns.npy` with shape `[15]` for NumPy/PyTorch interop.
 - `cargo run -p robotics-cli -- ingest synthetic-parquet --out data/parquet/synthetic/session.parquet --row-group-rows 25 --hz 50 --duration-ns 1000000000`: wrote 3 row groups.
 - `cargo run -p robotics-cli -- index parquet --input data/parquet/synthetic/session.parquet`: indexed 3 row groups, 3,696 selected bytes, first window `[0, 480000000]` ns.
+- `cargo run -p robotics-cli -- catalog build --input data/parquet/synthetic/session.parquet --out data/catalog/fleet_metadata.parquet`: writes a hot catalog Parquet file with row-group byte offsets, time ranges, trajectory bounds, and velocity statistics.
 - `cargo run -p robotics-cli -- range-read parquet --input data/parquet/synthetic/session.parquet --limit 1`: indexed 3 row groups, executed 1 range read, transferred 1,550 bytes from an 11,238 byte Parquet file.
+- `cargo run -p robotics-cli -- tensor parquet-row-groups --input data/parquet/synthetic/session.parquet --row-groups 0 --start-ts-ns 0 --end-ts-ns 480000000 --out data/tensor/query`: materializes selected row groups into tensor `.npy` files without loading unrelated row groups.
 - `cargo run -p robotics-cli -- ingest synthetic-mcap --out data/mcap/synthetic/session.mcap --topic /pose --hz 20 --duration-ns 1000000000`: wrote 21 JSON pose MCAP messages.
 - `cargo run -p robotics-cli -- ingest mcap-json --input data/mcap/synthetic/session.mcap --out data/parquet/mcap/session.parquet --topic /pose --row-group-rows 10`: converted 21 MCAP samples into 3 Parquet row groups.
 - `cargo run -p robotics-cli -- ingest mcap-pose --input path/to/poses.mcap --out data/parquet/mcap/pose.parquet --topic /pose`: supports JSON pose payloads plus ROS1/ROS2 `geometry_msgs/PoseStamped`, `geometry_msgs/TransformStamped`, and `nav_msgs/Odometry` pose messages.
@@ -78,8 +82,9 @@ Sensor rows use nanosecond timestamps, `robot_id`, `session_id`, pose position, 
 
 ## Open Risks
 - Parquet row-group byte ranges are currently derived from min/max column chunk byte ranges; this is validated against local files and live MinIO, but should still be tested against production S3 objects.
+- DuckDB integration currently lives in the Python facade over a hot catalog Parquet file; there is no persisted DuckDB database, R-tree/Hilbert spatial index, or SQL extension yet.
 - MCAP pose ingestion supports JSON pose, common ROS pose schemas, ROS1 binary, and basic ROS2 CDR; CARLA/Hilti bag variants may still need dataset-specific topic/schema mapping.
 - KITTI OXTS ingestion currently covers pose/GPS/velocity packets only; camera/LiDAR calibration and sensor frame transforms are not yet modeled.
 - nuScenes ingestion currently covers `ego_pose.json`; sample, sensor calibration, camera/LiDAR annotations, and scene joins are not yet modeled.
-- Zero-copy DLPack/PyTorch interop is deferred; current Python interop uses NumPy `.npy` files loadable via `numpy.load` and `torch.from_numpy`.
+- Zero-copy DLPack/PyTorch interop is deferred; current Python interop uses NumPy `.npy` files loaded by `physicaldb.query()` and optionally wrapped with `torch.from_numpy`.
 - Public datasets vary substantially in schema and calibration conventions; initial demo should use synthetic or MCAP/CARLA data with controlled ground truth.

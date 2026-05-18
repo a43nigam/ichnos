@@ -1,7 +1,15 @@
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::Path;
+use std::sync::Arc;
 
+use arrow_array::{
+    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, UInt32Array, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use robotics_core::{CatalogEntry, QuerySpec, WindowRef};
@@ -93,6 +101,108 @@ pub fn query_catalog(entries: &[CatalogEntry], spec: &QuerySpec) -> Vec<WindowRe
 
 pub fn total_selected_bytes(windows: &[WindowRef]) -> u64 {
     windows.iter().map(|window| window.entry.byte_length).sum()
+}
+
+pub fn catalog_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("robot_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("file_uri", DataType::Utf8, false),
+        Field::new("row_group_id", DataType::UInt32, false),
+        Field::new("start_ts_ns", DataType::Int64, false),
+        Field::new("end_ts_ns", DataType::Int64, false),
+        Field::new("min_x", DataType::Float64, false),
+        Field::new("max_x", DataType::Float64, false),
+        Field::new("min_y", DataType::Float64, false),
+        Field::new("max_y", DataType::Float64, false),
+        Field::new("min_z", DataType::Float64, false),
+        Field::new("max_z", DataType::Float64, false),
+        Field::new("min_velocity", DataType::Float64, false),
+        Field::new("max_velocity", DataType::Float64, false),
+        Field::new("byte_offset", DataType::UInt64, false),
+        Field::new("byte_length", DataType::UInt64, false),
+        Field::new("row_count", DataType::UInt64, false),
+    ]))
+}
+
+pub fn write_catalog_parquet(path: impl AsRef<Path>, entries: &[CatalogEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    if let Some(parent) = path.as_ref().parent() {
+        std::fs::create_dir_all(parent).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    }
+
+    let schema = catalog_schema();
+    let batch = catalog_batch(schema.clone(), entries)?;
+    let file = File::create(path.as_ref()).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let props = WriterProperties::builder().build();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    writer
+        .write(&batch)
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    writer
+        .close()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    Ok(())
+}
+
+fn catalog_batch(schema: SchemaRef, entries: &[CatalogEntry]) -> Result<RecordBatch> {
+    let arrays: Vec<ArrayRef> = vec![
+        Arc::new(StringArray::from_iter_values(
+            entries.iter().map(|entry| entry.robot_id.as_str()),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            entries.iter().map(|entry| entry.session_id.as_str()),
+        )),
+        Arc::new(StringArray::from_iter_values(
+            entries.iter().map(|entry| entry.file_uri.as_str()),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            entries.iter().map(|entry| entry.row_group_id),
+        )),
+        Arc::new(Int64Array::from_iter_values(
+            entries.iter().map(|entry| entry.start_ts_ns),
+        )),
+        Arc::new(Int64Array::from_iter_values(
+            entries.iter().map(|entry| entry.end_ts_ns),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.min_x),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.max_x),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.min_y),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.max_y),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.min_z),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.max_z),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.min_velocity),
+        )),
+        Arc::new(Float64Array::from_iter_values(
+            entries.iter().map(|entry| entry.max_velocity),
+        )),
+        Arc::new(UInt64Array::from_iter_values(
+            entries.iter().map(|entry| entry.byte_offset),
+        )),
+        Arc::new(UInt64Array::from_iter_values(
+            entries.iter().map(|entry| entry.byte_length),
+        )),
+        Arc::new(UInt64Array::from_iter_values(
+            entries.iter().map(|entry| entry.row_count),
+        )),
+    ];
+    RecordBatch::try_new(schema, arrays).map_err(|err| RoboticsError::Io(err.to_string()))
 }
 
 pub fn index_parquet_file(path: impl AsRef<Path>) -> Result<Vec<CatalogEntry>> {
@@ -337,5 +447,40 @@ mod tests {
         assert!(entries[1].byte_offset > entries[0].byte_offset);
 
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn writes_hot_catalog_as_parquet() {
+        let source_path = std::env::temp_dir().join(format!(
+            "robotics_catalog_{}_source.parquet",
+            std::process::id()
+        ));
+        let catalog_path = std::env::temp_dir().join(format!(
+            "robotics_catalog_{}_catalog.parquet",
+            std::process::id()
+        ));
+        robotics_ingest::write_synthetic_parquet(
+            &source_path,
+            "humanoid_01",
+            "session_001",
+            robotics_ingest::SyntheticConfig {
+                hz: 10.0,
+                duration_ns: 900_000_000,
+                start_ts_ns: 1_000,
+            },
+            5,
+        )
+        .unwrap();
+        let entries = index_parquet_file(&source_path).unwrap();
+
+        write_catalog_parquet(&catalog_path, &entries).unwrap();
+        let reader = SerializedFileReader::try_from(catalog_path.as_path()).unwrap();
+
+        assert_eq!(
+            reader.metadata().file_metadata().num_rows(),
+            entries.len() as i64
+        );
+        std::fs::remove_file(source_path).ok();
+        std::fs::remove_file(catalog_path).ok();
     }
 }
