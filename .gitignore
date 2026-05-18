@@ -1,5 +1,6 @@
 /target/
 /data/
+/vicon_room1/
 /.tmp/
 /.Rhistory
 /.pytest_cache/

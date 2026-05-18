@@ -30,6 +30,25 @@ impl PoseSample {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ImuSample {
+    pub timestamp_ns: TimestampNs,
+    pub robot_id: String,
+    pub session_id: String,
+    pub ax: f64,
+    pub ay: f64,
+    pub az: f64,
+    pub gx: f64,
+    pub gy: f64,
+    pub gz: f64,
+}
+
+impl ImuSample {
+    pub fn channels(&self) -> [f64; 6] {
+        [self.ax, self.ay, self.az, self.gx, self.gy, self.gz]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatalogEntry {
     pub robot_id: String,
     pub session_id: String,
@@ -48,6 +67,11 @@ pub struct CatalogEntry {
     pub byte_offset: u64,
     pub byte_length: u64,
     pub row_count: u64,
+    pub gap_count: u64,
+    pub max_gap_ns: TimestampNs,
+    pub max_gap_start_ts_ns: TimestampNs,
+    pub max_gap_end_ts_ns: TimestampNs,
+    pub nominal_dt_ns: TimestampNs,
 }
 
 impl CatalogEntry {

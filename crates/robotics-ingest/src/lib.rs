@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufRead, BufReader, BufWriter, Cursor};
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
@@ -11,6 +12,7 @@ use mcap::records::MessageHeader;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+pub use robotics_core::ImuSample;
 use robotics_core::PoseSample;
 use robotics_core::{Result, RoboticsError};
 use serde::{Deserialize, Serialize};
@@ -85,6 +87,12 @@ pub struct NuscenesEgoConfig {
     pub session_id: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct EurocConfig {
+    pub robot_id: String,
+    pub session_id: String,
+}
+
 impl Default for KittiOxtsConfig {
     fn default() -> Self {
         Self {
@@ -99,6 +107,15 @@ impl Default for NuscenesEgoConfig {
         Self {
             robot_id: "nuscenes_ego".to_string(),
             session_id: "nuscenes_scene".to_string(),
+        }
+    }
+}
+
+impl Default for EurocConfig {
+    fn default() -> Self {
+        Self {
+            robot_id: "euroc_mav".to_string(),
+            session_id: "euroc_session".to_string(),
         }
     }
 }
@@ -167,6 +184,20 @@ pub fn pose_schema() -> SchemaRef {
     ]))
 }
 
+pub fn imu_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("timestamp_ns", DataType::Int64, false),
+        Field::new("robot_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("ax", DataType::Float64, false),
+        Field::new("ay", DataType::Float64, false),
+        Field::new("az", DataType::Float64, false),
+        Field::new("gx", DataType::Float64, false),
+        Field::new("gy", DataType::Float64, false),
+        Field::new("gz", DataType::Float64, false),
+    ]))
+}
+
 pub fn write_pose_parquet(
     path: impl AsRef<Path>,
     samples: &[PoseSample],
@@ -196,6 +227,50 @@ pub fn write_pose_parquet(
 
     for chunk in samples.chunks(row_group_rows) {
         let batch = pose_batch(schema.clone(), chunk)?;
+        writer
+            .write(&batch)
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        writer
+            .flush()
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        row_groups += 1;
+    }
+
+    writer
+        .close()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    Ok(row_groups)
+}
+
+pub fn write_imu_parquet(
+    path: impl AsRef<Path>,
+    samples: &[ImuSample],
+    row_group_rows: usize,
+) -> Result<usize> {
+    if samples.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    if row_group_rows == 0 {
+        return Err(RoboticsError::InvalidArgument(
+            "row_group_rows must be positive".to_string(),
+        ));
+    }
+
+    if let Some(parent) = path.as_ref().parent() {
+        std::fs::create_dir_all(parent).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    }
+
+    let file = File::create(path.as_ref()).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let schema = imu_schema();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut row_groups = 0;
+
+    for chunk in samples.chunks(row_group_rows) {
+        let batch = imu_batch(schema.clone(), chunk)?;
         writer
             .write(&batch)
             .map_err(|err| RoboticsError::Io(err.to_string()))?;
@@ -261,6 +336,37 @@ pub fn read_pose_parquet_row_groups(
     let mut samples = Vec::new();
     for batch in &mut reader {
         samples.extend(pose_samples_from_batch(
+            &batch.map_err(|err| RoboticsError::Io(err.to_string()))?,
+        )?);
+    }
+    if samples.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    samples.sort_by_key(|sample| sample.timestamp_ns);
+    Ok(samples)
+}
+
+pub fn read_imu_parquet_row_groups(
+    path: impl AsRef<Path>,
+    row_group_ids: &[u32],
+) -> Result<Vec<ImuSample>> {
+    if row_group_ids.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+
+    let file = File::open(path.as_ref()).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let row_group_count = builder.metadata().num_row_groups();
+    let row_groups = normalize_row_group_ids(row_group_ids, row_group_count)?;
+
+    let mut reader = builder
+        .with_row_groups(row_groups)
+        .build()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut samples = Vec::new();
+    for batch in &mut reader {
+        samples.extend(imu_samples_from_batch(
             &batch.map_err(|err| RoboticsError::Io(err.to_string()))?,
         )?);
     }
@@ -521,6 +627,111 @@ pub fn write_nuscenes_ego_pose_to_parquet(
 ) -> Result<(usize, usize)> {
     let samples = read_nuscenes_ego_pose(input, config)?;
     let row_groups = write_pose_parquet(output, &samples, row_group_rows)?;
+    Ok((samples.len(), row_groups))
+}
+
+pub fn read_euroc_groundtruth_pose(
+    input: impl AsRef<Path>,
+    config: &EurocConfig,
+) -> Result<Vec<PoseSample>> {
+    let bytes = read_euroc_member(input.as_ref(), "mav0/state_groundtruth_estimate0/data.csv")?;
+    let reader = BufReader::new(Cursor::new(bytes));
+    let mut samples = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| RoboticsError::Io(err.to_string()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = parse_csv_parts(trimmed);
+        if parts.len() < 11 {
+            return Err(RoboticsError::InvalidArgument(format!(
+                "EuRoC groundtruth row has {} columns, expected at least 11",
+                parts.len()
+            )));
+        }
+        samples.push(PoseSample {
+            timestamp_ns: parse_i64_field(parts[0], "EuRoC groundtruth timestamp")?,
+            robot_id: config.robot_id.clone(),
+            session_id: config.session_id.clone(),
+            x: parse_f64_field(parts[1], "EuRoC groundtruth x")?,
+            y: parse_f64_field(parts[2], "EuRoC groundtruth y")?,
+            z: parse_f64_field(parts[3], "EuRoC groundtruth z")?,
+            qw: parse_f64_field(parts[4], "EuRoC groundtruth qw")?,
+            qx: parse_f64_field(parts[5], "EuRoC groundtruth qx")?,
+            qy: parse_f64_field(parts[6], "EuRoC groundtruth qy")?,
+            qz: parse_f64_field(parts[7], "EuRoC groundtruth qz")?,
+            vx: parse_f64_field(parts[8], "EuRoC groundtruth vx")?,
+            vy: parse_f64_field(parts[9], "EuRoC groundtruth vy")?,
+            vz: parse_f64_field(parts[10], "EuRoC groundtruth vz")?,
+        });
+    }
+
+    if samples.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    samples.sort_by_key(|sample| sample.timestamp_ns);
+    Ok(samples)
+}
+
+pub fn read_euroc_imu(input: impl AsRef<Path>, config: &EurocConfig) -> Result<Vec<ImuSample>> {
+    let bytes = read_euroc_member(input.as_ref(), "mav0/imu0/data.csv")?;
+    let reader = BufReader::new(Cursor::new(bytes));
+    let mut samples = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| RoboticsError::Io(err.to_string()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = parse_csv_parts(trimmed);
+        if parts.len() != 7 {
+            return Err(RoboticsError::InvalidArgument(format!(
+                "EuRoC IMU row has {} columns, expected 7",
+                parts.len()
+            )));
+        }
+        samples.push(ImuSample {
+            timestamp_ns: parse_i64_field(parts[0], "EuRoC IMU timestamp")?,
+            robot_id: config.robot_id.clone(),
+            session_id: config.session_id.clone(),
+            gx: parse_f64_field(parts[1], "EuRoC IMU gx")?,
+            gy: parse_f64_field(parts[2], "EuRoC IMU gy")?,
+            gz: parse_f64_field(parts[3], "EuRoC IMU gz")?,
+            ax: parse_f64_field(parts[4], "EuRoC IMU ax")?,
+            ay: parse_f64_field(parts[5], "EuRoC IMU ay")?,
+            az: parse_f64_field(parts[6], "EuRoC IMU az")?,
+        });
+    }
+
+    if samples.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    samples.sort_by_key(|sample| sample.timestamp_ns);
+    Ok(samples)
+}
+
+pub fn write_euroc_groundtruth_to_parquet(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    config: &EurocConfig,
+    row_group_rows: usize,
+) -> Result<(usize, usize)> {
+    let samples = read_euroc_groundtruth_pose(input, config)?;
+    let row_groups = write_pose_parquet(output, &samples, row_group_rows)?;
+    Ok((samples.len(), row_groups))
+}
+
+pub fn write_euroc_imu_to_parquet(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    config: &EurocConfig,
+    row_group_rows: usize,
+) -> Result<(usize, usize)> {
+    let samples = read_euroc_imu(input, config)?;
+    let row_groups = write_imu_parquet(output, &samples, row_group_rows)?;
     Ok((samples.len(), row_groups))
 }
 
@@ -936,6 +1147,72 @@ fn derive_pose_sample_velocities(samples: &mut [PoseSample]) {
 
 fn pose_motion_fields(sample: &PoseSample) -> (i64, f64, f64, f64) {
     (sample.timestamp_ns, sample.x, sample.y, sample.z)
+}
+
+fn read_euroc_member(input: &Path, relative_path: &str) -> Result<Vec<u8>> {
+    let direct_path = input.join(relative_path);
+    if direct_path.is_file() {
+        return std::fs::read(&direct_path).map_err(|err| RoboticsError::Io(err.to_string()));
+    }
+
+    let zip_path = resolve_euroc_zip(input)?;
+    let output = Command::new("unzip")
+        .arg("-p")
+        .arg(&zip_path)
+        .arg(relative_path)
+        .output()
+        .map_err(|err| RoboticsError::Io(format!("failed to run unzip: {err}")))?;
+    if !output.status.success() {
+        return Err(RoboticsError::Io(format!(
+            "failed to read {relative_path} from {}: {}",
+            zip_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    if output.stdout.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    Ok(output.stdout)
+}
+
+fn resolve_euroc_zip(input: &Path) -> Result<std::path::PathBuf> {
+    if input
+        .extension()
+        .is_some_and(|extension| extension == "zip")
+        && input.is_file()
+    {
+        return Ok(input.to_path_buf());
+    }
+    if input.is_dir() {
+        let mut zip_files = std::fs::read_dir(input)
+            .map_err(|err| RoboticsError::Io(err.to_string()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        zip_files.retain(|path| path.extension().is_some_and(|extension| extension == "zip"));
+        zip_files.sort();
+        if let Some(path) = zip_files.into_iter().next() {
+            return Ok(path);
+        }
+    }
+    Err(RoboticsError::InvalidArgument(format!(
+        "EuRoC input must be an extracted sequence directory or .zip file: {}",
+        input.display()
+    )))
+}
+
+fn parse_csv_parts(line: &str) -> Vec<&str> {
+    line.split(',').map(str::trim).collect()
+}
+
+fn parse_i64_field(raw: &str, name: &str) -> Result<i64> {
+    raw.parse::<i64>()
+        .map_err(|err| RoboticsError::InvalidArgument(format!("invalid {name} {raw:?}: {err}")))
+}
+
+fn parse_f64_field(raw: &str, name: &str) -> Result<f64> {
+    raw.parse::<f64>()
+        .map_err(|err| RoboticsError::InvalidArgument(format!("invalid {name} {raw:?}: {err}")))
 }
 
 impl From<McapPoseConfig> for McapJsonPoseConfig {
@@ -1375,6 +1652,50 @@ fn pose_batch(schema: SchemaRef, samples: &[PoseSample]) -> Result<RecordBatch> 
         .map_err(|err| RoboticsError::InvalidArgument(err.to_string()))
 }
 
+fn imu_batch(schema: SchemaRef, samples: &[ImuSample]) -> Result<RecordBatch> {
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            samples
+                .iter()
+                .map(|sample| sample.timestamp_ns)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            samples
+                .iter()
+                .map(|sample| sample.robot_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            samples
+                .iter()
+                .map(|sample| sample.session_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.ax).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.ay).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.az).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.gx).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.gy).collect::<Vec<_>>(),
+        )),
+        Arc::new(Float64Array::from(
+            samples.iter().map(|sample| sample.gz).collect::<Vec<_>>(),
+        )),
+    ];
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|err| RoboticsError::InvalidArgument(err.to_string()))
+}
+
 fn pose_samples_from_batch(batch: &RecordBatch) -> Result<Vec<PoseSample>> {
     let timestamp_ns = int64_batch_column(batch, "timestamp_ns")?;
     let robot_id = string_batch_column(batch, "robot_id")?;
@@ -1410,6 +1731,58 @@ fn pose_samples_from_batch(batch: &RecordBatch) -> Result<Vec<PoseSample>> {
     }
 
     Ok(samples)
+}
+
+fn imu_samples_from_batch(batch: &RecordBatch) -> Result<Vec<ImuSample>> {
+    let timestamp_ns = int64_batch_column(batch, "timestamp_ns")?;
+    let robot_id = string_batch_column(batch, "robot_id")?;
+    let session_id = string_batch_column(batch, "session_id")?;
+    let ax = float64_batch_column(batch, "ax")?;
+    let ay = float64_batch_column(batch, "ay")?;
+    let az = float64_batch_column(batch, "az")?;
+    let gx = float64_batch_column(batch, "gx")?;
+    let gy = float64_batch_column(batch, "gy")?;
+    let gz = float64_batch_column(batch, "gz")?;
+    let mut samples = Vec::with_capacity(batch.num_rows());
+
+    for row in 0..batch.num_rows() {
+        samples.push(ImuSample {
+            timestamp_ns: timestamp_ns.value(row),
+            robot_id: robot_id.value(row).to_string(),
+            session_id: session_id.value(row).to_string(),
+            ax: ax.value(row),
+            ay: ay.value(row),
+            az: az.value(row),
+            gx: gx.value(row),
+            gy: gy.value(row),
+            gz: gz.value(row),
+        });
+    }
+
+    Ok(samples)
+}
+
+fn normalize_row_group_ids(row_group_ids: &[u32], row_group_count: usize) -> Result<Vec<usize>> {
+    let mut row_groups = row_group_ids
+        .iter()
+        .map(|row_group_id| {
+            usize::try_from(*row_group_id).map_err(|_| {
+                RoboticsError::InvalidArgument(format!("row group id {row_group_id} is too large"))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    row_groups.sort_unstable();
+    row_groups.dedup();
+    if let Some(row_group_id) = row_groups
+        .iter()
+        .copied()
+        .find(|row_group_id| *row_group_id >= row_group_count)
+    {
+        return Err(RoboticsError::InvalidArgument(format!(
+            "row group id {row_group_id} is outside 0..{row_group_count}"
+        )));
+    }
+    Ok(row_groups)
 }
 
 fn int64_batch_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
@@ -1781,6 +2154,113 @@ mod tests {
         assert_eq!(samples[1].vx, 2.0);
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_euroc_groundtruth_and_imu_csv() {
+        let root =
+            std::env::temp_dir().join(format!("robotics_euroc_{}_{}", std::process::id(), "read"));
+        let gt_dir = root.join("mav0").join("state_groundtruth_estimate0");
+        let imu_dir = root.join("mav0").join("imu0");
+        std::fs::create_dir_all(&gt_dir).unwrap();
+        std::fs::create_dir_all(&imu_dir).unwrap();
+        std::fs::write(
+            gt_dir.join("data.csv"),
+            "#timestamp,p_x,p_y,p_z,q_w,q_x,q_y,q_z,v_x,v_y,v_z,bgx,bgy,bgz,bax,bay,baz\n\
+             1403715274302142976,1.0,2.0,3.0,1.0,0.0,0.0,0.0,0.1,0.2,0.3,0,0,0,0,0,0\n\
+             1403715274307142912,1.1,2.1,3.1,1.0,0.0,0.0,0.0,0.4,0.5,0.6,0,0,0,0,0,0\n",
+        )
+        .unwrap();
+        std::fs::write(
+            imu_dir.join("data.csv"),
+            "#timestamp,w_x,w_y,w_z,a_x,a_y,a_z\n\
+             1403715273262142976,0.01,0.02,0.03,9.0,0.1,-3.6\n\
+             1403715273267142912,0.04,0.05,0.06,9.1,0.2,-3.5\n",
+        )
+        .unwrap();
+
+        let config = EurocConfig {
+            robot_id: "mav0".to_string(),
+            session_id: "V1_01_easy".to_string(),
+        };
+        let pose = read_euroc_groundtruth_pose(&root, &config).unwrap();
+        let imu = read_euroc_imu(&root, &config).unwrap();
+
+        assert_eq!(pose.len(), 2);
+        assert_eq!(pose[0].timestamp_ns, 1_403_715_274_302_142_976);
+        assert_eq!(pose[0].robot_id, "mav0");
+        assert_eq!(pose[0].x, 1.0);
+        assert_eq!(pose[1].vz, 0.6);
+        assert_eq!(imu.len(), 2);
+        assert_eq!(imu[0].timestamp_ns, 1_403_715_273_262_142_976);
+        assert_eq!(imu[0].gx, 0.01);
+        assert_eq!(imu[0].ax, 9.0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn converts_euroc_imu_to_parquet() {
+        let root = std::env::temp_dir().join(format!(
+            "robotics_euroc_{}_{}",
+            std::process::id(),
+            "parquet"
+        ));
+        let imu_dir = root.join("mav0").join("imu0");
+        let parquet_path = root.join("imu.parquet");
+        std::fs::create_dir_all(&imu_dir).unwrap();
+        std::fs::write(
+            imu_dir.join("data.csv"),
+            "#timestamp,w_x,w_y,w_z,a_x,a_y,a_z\n\
+             1403715273262142976,0.01,0.02,0.03,9.0,0.1,-3.6\n\
+             1403715273267142912,0.04,0.05,0.06,9.1,0.2,-3.5\n",
+        )
+        .unwrap();
+
+        let (samples, row_groups) =
+            write_euroc_imu_to_parquet(&root, &parquet_path, &EurocConfig::default(), 1).unwrap();
+
+        assert_eq!(samples, 2);
+        assert_eq!(row_groups, 2);
+        assert!(parquet_path.metadata().unwrap().len() > 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_selected_imu_parquet_row_groups() {
+        let path = std::env::temp_dir().join(format!(
+            "robotics_imu_{}_row_group_read.parquet",
+            std::process::id()
+        ));
+        let samples = vec![
+            imu_sample_at(0, 0.0),
+            imu_sample_at(1, 1.0),
+            imu_sample_at(2, 10.0),
+            imu_sample_at(3, 11.0),
+        ];
+        write_imu_parquet(&path, &samples, 2).unwrap();
+
+        let selected = read_imu_parquet_row_groups(&path, &[1]).unwrap();
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].timestamp_ns, 2);
+        assert_eq!(selected[0].ax, 10.0);
+        std::fs::remove_file(path).ok();
+    }
+
+    fn imu_sample_at(timestamp_ns: i64, value: f64) -> ImuSample {
+        ImuSample {
+            timestamp_ns,
+            robot_id: "robot".to_string(),
+            session_id: "session".to_string(),
+            ax: value,
+            ay: value + 1.0,
+            az: value + 2.0,
+            gx: value + 3.0,
+            gy: value + 4.0,
+            gz: value + 5.0,
+        }
     }
 
     fn write_oxts_packet(

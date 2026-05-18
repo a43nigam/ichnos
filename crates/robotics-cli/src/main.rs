@@ -1,21 +1,31 @@
 use std::env;
+use std::process::Command;
 use std::process::ExitCode;
 use std::time::Instant;
 
 use robotics_catalog::{
-    generate_fake_catalog, index_parquet_file, index_parquet_file_with_uri, query_catalog,
-    total_selected_bytes, write_catalog_parquet, FakeCatalogConfig,
+    generate_fake_catalog, index_imu_parquet_file_with_uri_and_gap_threshold,
+    index_media_parquet_file_with_uri, index_parquet_file, index_parquet_file_with_uri,
+    index_parquet_file_with_uri_and_gap_threshold, query_catalog, total_selected_bytes,
+    write_catalog_parquet, write_imu_catalog_parquet, write_media_catalog_parquet,
+    FakeCatalogConfig,
 };
-use robotics_core::{BoundingBox, QuerySpec};
+use robotics_core::{BoundingBox, PoseSample, QuerySpec};
 use robotics_ingest::{
-    generate_synthetic_pose, read_pose_parquet_row_groups, write_json_pose_mcap,
-    write_json_pose_mcap_to_parquet, write_kitti_oxts_to_parquet,
-    write_nuscenes_ego_pose_to_parquet, write_pose_mcap_to_parquet, write_pose_parquet,
-    write_synthetic_parquet, KittiOxtsConfig, McapJsonPoseConfig, McapPoseConfig,
-    NuscenesEgoConfig, SyntheticConfig,
+    generate_synthetic_pose, read_pose_parquet_row_groups, write_euroc_groundtruth_to_parquet,
+    write_euroc_imu_to_parquet, write_json_pose_mcap, write_json_pose_mcap_to_parquet,
+    write_kitti_oxts_to_parquet, write_nuscenes_ego_pose_to_parquet, write_pose_mcap_to_parquet,
+    write_pose_parquet, write_synthetic_parquet, EurocConfig, KittiOxtsConfig, McapJsonPoseConfig,
+    McapPoseConfig, NuscenesEgoConfig, SyntheticConfig,
 };
-use robotics_query::{account_reads, execute_object_store_range_reads, plan_range_reads};
-use robotics_tensor::{tensorize, write_tensor_npy};
+use robotics_query::{
+    account_reads, audit_row_group_range_reads, execute_object_store_range_reads, plan_range_reads,
+    put_object_store_file, read_imu_parquet_row_groups_from_uri,
+    read_imu_parquet_row_groups_from_uri_enforced, read_pose_parquet_row_groups_from_uri,
+    read_pose_parquet_row_groups_from_uri_enforced, RangeAudit, RangeAuditReport, RowGroupRange,
+    SeekManifest,
+};
+use robotics_tensor::{gap_stats, read_i64_npy, tensorize, tensorize_imu, write_tensor_npy};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -26,6 +36,21 @@ async fn main() -> ExitCode {
         }
         Some("catalog") if args.get(2).map(String::as_str) == Some("build") => {
             catalog_build(&args[3..])
+        }
+        Some("catalog") if args.get(2).map(String::as_str) == Some("build-imu") => {
+            catalog_build_imu(&args[3..])
+        }
+        Some("catalog") if args.get(2).map(String::as_str) == Some("build-media") => {
+            catalog_build_media(&args[3..])
+        }
+        Some("catalog") if args.get(2).map(String::as_str) == Some("duckdb-build") => {
+            catalog_duckdb_build(&args[3..])
+        }
+        Some("catalog") if args.get(2).map(String::as_str) == Some("fake-duckdb") => {
+            catalog_fake_duckdb(&args[3..])
+        }
+        Some("catalog") if args.get(2).map(String::as_str) == Some("explain") => {
+            catalog_explain(&args[3..])
         }
         Some("ingest") if args.get(2).map(String::as_str) == Some("synthetic-parquet") => {
             ingest_synthetic_parquet(&args[3..])
@@ -45,6 +70,12 @@ async fn main() -> ExitCode {
         Some("ingest") if args.get(2).map(String::as_str) == Some("nuscenes-ego") => {
             ingest_nuscenes_ego(&args[3..])
         }
+        Some("ingest") if args.get(2).map(String::as_str) == Some("euroc-groundtruth") => {
+            ingest_euroc_groundtruth(&args[3..])
+        }
+        Some("ingest") if args.get(2).map(String::as_str) == Some("euroc-imu") => {
+            ingest_euroc_imu(&args[3..])
+        }
         Some("index") if args.get(2).map(String::as_str) == Some("parquet") => {
             index_parquet(&args[3..])
         }
@@ -54,8 +85,14 @@ async fn main() -> ExitCode {
         Some("validate") if args.get(2).map(String::as_str) == Some("s3-parquet") => {
             validate_s3_parquet(&args[3..]).await
         }
+        Some("object-store") if args.get(2).map(String::as_str) == Some("put") => {
+            object_store_put(&args[3..]).await
+        }
         Some("tensor") if args.get(2).map(String::as_str) == Some("parquet-row-groups") => {
-            tensor_parquet_row_groups(&args[3..])
+            tensor_parquet_row_groups(&args[3..]).await
+        }
+        Some("tensor") if args.get(2).map(String::as_str) == Some("imu-parquet-row-groups") => {
+            tensor_imu_parquet_row_groups(&args[3..]).await
         }
         Some("demo") if args.get(2).map(String::as_str) == Some("fake") => demo_fake(),
         Some("demo") => demo_parquet(&args[2..]).await,
@@ -235,6 +272,68 @@ fn ingest_nuscenes_ego(args: &[String]) -> ExitCode {
     }
 }
 
+fn ingest_euroc_groundtruth(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let out = parse_string_arg(args, "--out")
+        .unwrap_or_else(|| "data/parquet/euroc/pose.parquet".to_string());
+    let row_group_rows = parse_usize_arg(args, "--row-group-rows").unwrap_or(500);
+    let config = EurocConfig {
+        robot_id: parse_string_arg(args, "--robot-id").unwrap_or_else(|| "mav0".to_string()),
+        session_id: parse_string_arg(args, "--session-id")
+            .unwrap_or_else(|| "euroc_session".to_string()),
+    };
+
+    match write_euroc_groundtruth_to_parquet(&input, &out, &config, row_group_rows) {
+        Ok((samples, row_groups)) => {
+            println!("input={input}");
+            println!("out={out}");
+            println!("robot_id={}", config.robot_id);
+            println!("session_id={}", config.session_id);
+            println!("samples={samples}");
+            println!("row_groups={row_groups}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("EuRoC groundtruth ingest failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn ingest_euroc_imu(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let out = parse_string_arg(args, "--out")
+        .unwrap_or_else(|| "data/parquet/euroc/imu.parquet".to_string());
+    let row_group_rows = parse_usize_arg(args, "--row-group-rows").unwrap_or(2_000);
+    let config = EurocConfig {
+        robot_id: parse_string_arg(args, "--robot-id").unwrap_or_else(|| "mav0".to_string()),
+        session_id: parse_string_arg(args, "--session-id")
+            .unwrap_or_else(|| "euroc_session".to_string()),
+    };
+
+    match write_euroc_imu_to_parquet(&input, &out, &config, row_group_rows) {
+        Ok((samples, row_groups)) => {
+            println!("input={input}");
+            println!("out={out}");
+            println!("robot_id={}", config.robot_id);
+            println!("session_id={}", config.session_id);
+            println!("samples={samples}");
+            println!("row_groups={row_groups}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("EuRoC IMU ingest failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn ingest_synthetic_parquet(args: &[String]) -> ExitCode {
     let out = parse_string_arg(args, "--out")
         .unwrap_or_else(|| "data/parquet/synthetic/session.parquet".to_string());
@@ -305,26 +404,392 @@ fn catalog_build(args: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let file_uri = parse_string_arg(args, "--uri").unwrap_or_else(|| input.clone());
+    let gap_threshold_ns = parse_i64_arg(args, "--gap-threshold-ns");
 
-    let entries = match index_parquet_file_with_uri(&input, file_uri) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!("catalog index failed: {err}");
-            return ExitCode::from(1);
-        }
-    };
+    let entries =
+        match index_parquet_file_with_uri_and_gap_threshold(&input, file_uri, gap_threshold_ns) {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("catalog index failed: {err}");
+                return ExitCode::from(1);
+            }
+        };
     let indexed_bytes: u64 = entries.iter().map(|entry| entry.byte_length).sum();
+    let gap_row_groups = entries.iter().filter(|entry| entry.gap_count > 0).count();
+    let max_gap_ns = entries
+        .iter()
+        .map(|entry| entry.max_gap_ns)
+        .max()
+        .unwrap_or(0);
     match write_catalog_parquet(&out, &entries) {
         Ok(()) => {
             println!("out={out}");
             println!("indexed_row_groups={}", entries.len());
             println!("indexed_bytes={indexed_bytes}");
+            println!("gap_row_groups={gap_row_groups}");
+            println!("max_gap_ns={max_gap_ns}");
             ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("catalog write failed: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn catalog_build_imu(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let file_uri = parse_string_arg(args, "--uri").unwrap_or_else(|| input.clone());
+    let gap_threshold_ns = parse_i64_arg(args, "--gap-threshold-ns");
+
+    let entries =
+        match index_imu_parquet_file_with_uri_and_gap_threshold(&input, file_uri, gap_threshold_ns)
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                eprintln!("IMU catalog index failed: {err}");
+                return ExitCode::from(1);
+            }
+        };
+    let indexed_bytes: u64 = entries.iter().map(|entry| entry.byte_length).sum();
+    let gap_row_groups = entries.iter().filter(|entry| entry.gap_count > 0).count();
+    let max_gap_ns = entries
+        .iter()
+        .map(|entry| entry.max_gap_ns)
+        .max()
+        .unwrap_or(0);
+    match write_imu_catalog_parquet(&out, &entries) {
+        Ok(()) => {
+            println!("out={out}");
+            println!("indexed_row_groups={}", entries.len());
+            println!("indexed_bytes={indexed_bytes}");
+            println!("gap_row_groups={gap_row_groups}");
+            println!("max_gap_ns={max_gap_ns}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("IMU catalog write failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn catalog_build_media(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let Some(modality) = parse_string_arg(args, "--modality") else {
+        eprintln!("missing required --modality camera|lidar");
+        return ExitCode::from(2);
+    };
+    if !matches!(modality.as_str(), "camera" | "lidar") {
+        eprintln!("--modality must be camera or lidar");
+        return ExitCode::from(2);
+    }
+    let Some(stream_id) = parse_string_arg(args, "--stream-id") else {
+        eprintln!("missing required --stream-id");
+        return ExitCode::from(2);
+    };
+    let file_uri = parse_string_arg(args, "--uri").unwrap_or_else(|| input.clone());
+
+    let entries = match index_media_parquet_file_with_uri(&input, file_uri, &modality, &stream_id) {
+        Ok(entries) => entries,
+        Err(err) => {
+            eprintln!("media catalog index failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let indexed_bytes: u64 = entries.iter().map(|entry| entry.byte_length).sum();
+    match write_media_catalog_parquet(&out, &entries) {
+        Ok(()) => {
+            println!("out={out}");
+            println!("modality={modality}");
+            println!("stream_id={stream_id}");
+            println!("indexed_row_groups={}", entries.len());
+            println!("indexed_bytes={indexed_bytes}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("media catalog write failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn catalog_duckdb_build(args: &[String]) -> ExitCode {
+    let Some(pose_catalog) = parse_string_arg(args, "--pose-catalog") else {
+        eprintln!("missing required --pose-catalog");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let imu_catalog = parse_string_arg(args, "--imu-catalog");
+    let media_catalog = parse_string_arg(args, "--media-catalog");
+
+    match run_catalog_duckdb_build(
+        &out,
+        &pose_catalog,
+        imu_catalog.as_deref(),
+        media_catalog.as_deref(),
+    ) {
+        Ok(stdout) => {
+            print!("{stdout}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprint!("{err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn catalog_fake_duckdb(args: &[String]) -> ExitCode {
+    let sessions = parse_usize_arg(args, "--sessions").unwrap_or(100_000);
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let temp_catalog = std::env::temp_dir().join(format!(
+        "robotics_fake_catalog_{}_{}.parquet",
+        std::process::id(),
+        sessions
+    ));
+    let catalog = generate_fake_catalog(FakeCatalogConfig {
+        sessions,
+        ..Default::default()
+    });
+    if let Err(err) = write_catalog_parquet(&temp_catalog, &catalog) {
+        eprintln!("fake catalog parquet write failed: {err}");
+        return ExitCode::from(1);
+    }
+
+    let result = run_catalog_duckdb_build(
+        &out,
+        temp_catalog
+            .to_str()
+            .expect("temporary catalog path should be valid UTF-8"),
+        None,
+        None,
+    );
+    std::fs::remove_file(&temp_catalog).ok();
+
+    match result {
+        Ok(stdout) => {
+            print!("{stdout}");
+            println!("fake_sessions={sessions}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprint!("{err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn catalog_explain(args: &[String]) -> ExitCode {
+    let Some(catalog_db) = parse_string_arg(args, "--catalog-db") else {
+        eprintln!("missing required --catalog-db");
+        return ExitCode::from(2);
+    };
+    let predicate = parse_string_arg(args, "--predicate").unwrap_or_default();
+    let robot_id = parse_string_arg(args, "--robot-id").unwrap_or_default();
+    let start_ts_ns = parse_string_arg(args, "--start-ts-ns").unwrap_or_default();
+    let end_ts_ns = parse_string_arg(args, "--end-ts-ns").unwrap_or_default();
+
+    let script = r#"
+import sys
+from pathlib import Path
+
+root = Path.cwd() / "python"
+if root.exists():
+    sys.path.insert(0, str(root))
+
+from physicaldb import plan
+
+catalog_db, predicate, robot_id, start_ts_ns, end_ts_ns = sys.argv[1:6]
+kwargs = {
+    "catalog_db": catalog_db,
+    "channels": ("pos_xyz",),
+    "max_egress_bytes": 1_000_000_000_000,
+}
+if predicate:
+    kwargs["predicate"] = predicate
+if robot_id:
+    kwargs["robot_id"] = robot_id
+if start_ts_ns:
+    kwargs["start_ts_ns"] = int(start_ts_ns)
+if end_ts_ns:
+    kwargs["end_ts_ns"] = int(end_ts_ns)
+
+seek_plan = plan(**kwargs)
+diag = seek_plan.diagnostics
+print(f"catalog_db={catalog_db}")
+print(f"predicate={predicate}")
+print(f"candidate_row_groups={diag.candidate_row_groups}")
+print(f"matched_row_groups={diag.matched_row_groups}")
+print(f"time_pruned_row_groups={diag.time_pruned_row_groups}")
+print(f"spatial_pruned_row_groups={diag.spatial_pruned_row_groups}")
+print(f"velocity_pruned_row_groups={diag.velocity_pruned_row_groups}")
+print(f"authorized_total_bytes={seek_plan.authorized_total_bytes}")
+print("row_groups=" + ",".join(str(row_group) for row_group in seek_plan.row_groups))
+"#;
+
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            script,
+            &catalog_db,
+            &predicate,
+            &robot_id,
+            &start_ts_ns,
+            &end_ts_ns,
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+            ExitCode::SUCCESS
+        }
+        Ok(output) => {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            ExitCode::from(1)
+        }
+        Err(err) => {
+            eprintln!("catalog explain failed to start python3: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_catalog_duckdb_build(
+    out: &str,
+    pose_catalog: &str,
+    imu_catalog: Option<&str>,
+    media_catalog: Option<&str>,
+) -> std::result::Result<String, String> {
+    let script = r#"
+import sys
+from pathlib import Path
+
+try:
+    import duckdb
+except ModuleNotFoundError as exc:
+    raise SystemExit("duckdb Python package is required for catalog duckdb-build") from exc
+
+out, pose_catalog, imu_catalog, media_catalog = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+Path(out).parent.mkdir(parents=True, exist_ok=True)
+con = duckdb.connect(out)
+con.execute("""
+    CREATE OR REPLACE TABLE pose_row_groups AS
+    SELECT
+        *,
+        ((min_x + max_x) / 2.0) AS center_x,
+        ((min_y + max_y) / 2.0) AS center_y,
+        CAST(floor(min_x) AS BIGINT) AS tile_min_x,
+        CAST(floor(max_x) AS BIGINT) AS tile_max_x,
+        CAST(floor(min_y) AS BIGINT) AS tile_min_y,
+        CAST(floor(max_y) AS BIGINT) AS tile_max_y
+    FROM read_parquet(?)
+""", [pose_catalog])
+pose_count = con.execute("SELECT count(*) FROM pose_row_groups").fetchone()[0]
+if pose_count == 0:
+    raise SystemExit("pose catalog contains no row groups")
+con.execute("CREATE INDEX IF NOT EXISTS pose_robot_session_time_idx ON pose_row_groups(robot_id, session_id, start_ts_ns, end_ts_ns)")
+con.execute("CREATE INDEX IF NOT EXISTS pose_time_idx ON pose_row_groups(start_ts_ns, end_ts_ns)")
+con.execute("CREATE INDEX IF NOT EXISTS pose_bbox_idx ON pose_row_groups(min_x, max_x, min_y, max_y, min_z, max_z)")
+con.execute("CREATE INDEX IF NOT EXISTS pose_tile_idx ON pose_row_groups(tile_min_x, tile_max_x, tile_min_y, tile_max_y)")
+con.execute("CREATE INDEX IF NOT EXISTS pose_center_idx ON pose_row_groups(center_x, center_y)")
+con.execute("CREATE INDEX IF NOT EXISTS pose_velocity_idx ON pose_row_groups(max_velocity)")
+
+if imu_catalog:
+    con.execute("CREATE OR REPLACE TABLE imu_row_groups AS SELECT * FROM read_parquet(?)", [imu_catalog])
+else:
+    con.execute("""
+        CREATE OR REPLACE TABLE imu_row_groups (
+            robot_id VARCHAR,
+            session_id VARCHAR,
+            file_uri VARCHAR,
+            row_group_id UINTEGER,
+            start_ts_ns BIGINT,
+            end_ts_ns BIGINT,
+            byte_offset UBIGINT,
+            byte_length UBIGINT,
+            gap_count UBIGINT,
+            max_gap_ns BIGINT,
+            max_gap_start_ts_ns BIGINT,
+            max_gap_end_ts_ns BIGINT,
+            nominal_dt_ns BIGINT
+        )
+    """)
+imu_count = con.execute("SELECT count(*) FROM imu_row_groups").fetchone()[0]
+con.execute("CREATE INDEX IF NOT EXISTS imu_robot_session_time_idx ON imu_row_groups(robot_id, session_id, start_ts_ns, end_ts_ns)")
+con.execute("CREATE INDEX IF NOT EXISTS imu_time_idx ON imu_row_groups(start_ts_ns, end_ts_ns)")
+
+if media_catalog:
+    con.execute("CREATE OR REPLACE TABLE media_row_groups AS SELECT * FROM read_parquet(?)", [media_catalog])
+else:
+    con.execute("""
+        CREATE OR REPLACE TABLE media_row_groups (
+            robot_id VARCHAR,
+            session_id VARCHAR,
+            file_uri VARCHAR,
+            modality VARCHAR,
+            stream_id VARCHAR,
+            row_group_id UINTEGER,
+            start_ts_ns BIGINT,
+            end_ts_ns BIGINT,
+            byte_offset UBIGINT,
+            byte_length UBIGINT,
+            row_count UBIGINT,
+            min_x DOUBLE,
+            max_x DOUBLE,
+            min_y DOUBLE,
+            max_y DOUBLE,
+            min_z DOUBLE,
+            max_z DOUBLE
+        )
+    """)
+media_count = con.execute("SELECT count(*) FROM media_row_groups").fetchone()[0]
+con.execute("CREATE INDEX IF NOT EXISTS media_robot_session_time_idx ON media_row_groups(robot_id, session_id, start_ts_ns, end_ts_ns)")
+con.execute("CREATE INDEX IF NOT EXISTS media_modality_stream_idx ON media_row_groups(modality, stream_id)")
+con.execute("CREATE INDEX IF NOT EXISTS media_time_idx ON media_row_groups(start_ts_ns, end_ts_ns)")
+con.close()
+print(f"out={out}")
+print(f"pose_row_groups={pose_count}")
+print(f"imu_row_groups={imu_count}")
+print(f"media_row_groups={media_count}")
+"#;
+
+    let output = Command::new("python3")
+        .args([
+            "-c",
+            script,
+            out,
+            pose_catalog,
+            imu_catalog.unwrap_or(""),
+            media_catalog.unwrap_or(""),
+        ])
+        .output()
+        .map_err(|err| format!("catalog DuckDB build failed to start python3: {err}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
     }
 }
 
@@ -405,7 +870,31 @@ async fn validate_s3_parquet(args: &[String]) -> ExitCode {
     status
 }
 
-fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
+async fn object_store_put(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let Some(uri) = parse_string_arg(args, "--uri") else {
+        eprintln!("missing required --uri s3://bucket/key or compatible object-store URI");
+        return ExitCode::from(2);
+    };
+
+    match put_object_store_file(&input, &uri).await {
+        Ok(uploaded_bytes) => {
+            println!("input={input}");
+            println!("uri={uri}");
+            println!("uploaded_bytes={uploaded_bytes}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("object-store put failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
     let Some(input) = parse_string_arg(args, "--input") else {
         eprintln!("missing required --input");
         return ExitCode::from(2);
@@ -424,6 +913,10 @@ fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
     };
     let hz = parse_f64_arg(args, "--hz").unwrap_or(30.0);
     let out = parse_string_arg(args, "--out");
+    let enforce_ranges = has_flag(args, "--enforce-ranges");
+    let manifest_out = parse_string_arg(args, "--manifest-out");
+    let footer_allowance_bytes =
+        parse_u64_arg(args, "--footer-allowance-bytes").unwrap_or(16 * 1024 * 1024);
     let row_groups = match parse_u32_csv(&row_groups_raw, "--row-groups") {
         Ok(row_groups) => row_groups,
         Err(err) => {
@@ -431,14 +924,55 @@ fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let range_audit = match parse_string_arg(args, "--audit-ranges") {
+        Some(raw) => match parse_row_group_ranges(&raw, "--audit-ranges").and_then(|ranges| {
+            audit_row_group_range_reads(&input, &row_groups, &ranges).map_err(|err| err.to_string())
+        }) {
+            Ok(audit) => Some(audit),
+            Err(err) => {
+                eprintln!("range audit failed: {err}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    if enforce_ranges && range_audit.is_none() {
+        eprintln!("--enforce-ranges requires --audit-ranges");
+        return ExitCode::from(2);
+    }
 
-    let samples = match read_pose_parquet_row_groups(&input, &row_groups) {
-        Ok(samples) => samples,
-        Err(err) => {
-            eprintln!("tensor row-group load failed: {err}");
-            return ExitCode::from(1);
+    let (samples, audit_report) = if enforce_ranges {
+        match read_pose_parquet_row_groups_from_uri_enforced(
+            &input,
+            &row_groups,
+            range_audit.as_ref().expect("checked audit exists"),
+            footer_allowance_bytes,
+        )
+        .await
+        {
+            Ok((samples, report)) => (samples, Some(report)),
+            Err(err) => {
+                eprintln!("tensor row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match read_pose_parquet_row_groups_from_uri(&input, &row_groups).await {
+            Ok(samples) => (samples, None),
+            Err(err) => {
+                eprintln!("tensor row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
         }
     };
+    let (pose_gap_count, pose_max_gap_ns) = {
+        let sample_timestamps = samples
+            .iter()
+            .map(|sample| sample.timestamp_ns)
+            .collect::<Vec<_>>();
+        gap_stats(&sample_timestamps)
+    };
+    let quaternion_inversions = pose_quaternion_inversions(&samples);
     let batch = match tensorize(&samples, start_ts_ns, end_ts_ns, hz) {
         Ok(batch) => batch,
         Err(err) => {
@@ -469,6 +1003,161 @@ fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
         "uniform_end_ns={}",
         batch.timestamps_ns.last().unwrap_or(&0)
     );
+    println!("pose_gap_count={pose_gap_count}");
+    println!("pose_max_gap_ns={pose_max_gap_ns}");
+    println!("pose_null_count=0");
+    println!("quaternion_inversions_applied={quaternion_inversions}");
+    print_range_audit(&range_audit);
+    print_audit_report(&audit_report);
+    if let Some(path) = manifest_out {
+        let manifest = SeekManifest::new(
+            input.clone(),
+            "pose",
+            row_groups.clone(),
+            range_audit.as_ref(),
+            audit_report.as_ref(),
+        );
+        if let Err(err) = write_manifest(&path, &manifest) {
+            eprintln!("manifest write failed: {err}");
+            return ExitCode::from(1);
+        }
+        println!("manifest_out={path}");
+    }
+    if let Some(files) = tensor_npy_files {
+        println!("tensor_values_npy={}", files.values_path.display());
+        println!("tensor_timestamps_npy={}", files.timestamps_path.display());
+    }
+    ExitCode::SUCCESS
+}
+
+async fn tensor_imu_parquet_row_groups(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let Some(row_groups_raw) = parse_string_arg(args, "--row-groups") else {
+        eprintln!("missing required --row-groups");
+        return ExitCode::from(2);
+    };
+    let Some(timestamps_npy) = parse_string_arg(args, "--timestamps-npy") else {
+        eprintln!("missing required --timestamps-npy");
+        return ExitCode::from(2);
+    };
+    let out = parse_string_arg(args, "--out");
+    let enforce_ranges = has_flag(args, "--enforce-ranges");
+    let manifest_out = parse_string_arg(args, "--manifest-out");
+    let footer_allowance_bytes =
+        parse_u64_arg(args, "--footer-allowance-bytes").unwrap_or(16 * 1024 * 1024);
+    let row_groups = match parse_u32_csv(&row_groups_raw, "--row-groups") {
+        Ok(row_groups) => row_groups,
+        Err(err) => {
+            eprintln!("IMU tensor argument error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let range_audit = match parse_string_arg(args, "--audit-ranges") {
+        Some(raw) => match parse_row_group_ranges(&raw, "--audit-ranges").and_then(|ranges| {
+            audit_row_group_range_reads(&input, &row_groups, &ranges).map_err(|err| err.to_string())
+        }) {
+            Ok(audit) => Some(audit),
+            Err(err) => {
+                eprintln!("IMU range audit failed: {err}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    if enforce_ranges && range_audit.is_none() {
+        eprintln!("--enforce-ranges requires --audit-ranges");
+        return ExitCode::from(2);
+    }
+    let timestamps_ns = match read_i64_npy(&timestamps_npy) {
+        Ok(timestamps_ns) => timestamps_ns,
+        Err(err) => {
+            eprintln!("IMU timestamp load failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let (samples, audit_report) = if enforce_ranges {
+        match read_imu_parquet_row_groups_from_uri_enforced(
+            &input,
+            &row_groups,
+            range_audit.as_ref().expect("checked audit exists"),
+            footer_allowance_bytes,
+        )
+        .await
+        {
+            Ok((samples, report)) => (samples, Some(report)),
+            Err(err) => {
+                eprintln!("IMU row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match read_imu_parquet_row_groups_from_uri(&input, &row_groups).await {
+            Ok(samples) => (samples, None),
+            Err(err) => {
+                eprintln!("IMU row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    let (imu_gap_count, imu_max_gap_ns) = {
+        let sample_timestamps = samples
+            .iter()
+            .map(|sample| sample.timestamp_ns)
+            .collect::<Vec<_>>();
+        gap_stats(&sample_timestamps)
+    };
+    let batch = match tensorize_imu(&samples, &timestamps_ns) {
+        Ok(batch) => batch,
+        Err(err) => {
+            eprintln!("IMU tensorization failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    let tensor_npy_files = match out {
+        Some(prefix) => match write_tensor_npy(&prefix, &batch) {
+            Ok(files) => Some(files),
+            Err(err) => {
+                eprintln!("IMU tensor export failed: {err}");
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+
+    println!("input={input}");
+    println!("row_groups={row_groups_raw}");
+    println!("source_rows={}", samples.len());
+    println!("tensor_shape=[{}, {}]", batch.rows, batch.channels);
+    println!(
+        "uniform_start_ns={}",
+        batch.timestamps_ns.first().unwrap_or(&0)
+    );
+    println!(
+        "uniform_end_ns={}",
+        batch.timestamps_ns.last().unwrap_or(&0)
+    );
+    println!("imu_gap_count={imu_gap_count}");
+    println!("imu_max_gap_ns={imu_max_gap_ns}");
+    println!("imu_null_count=0");
+    print_range_audit(&range_audit);
+    print_audit_report(&audit_report);
+    if let Some(path) = manifest_out {
+        let manifest = SeekManifest::new(
+            input.clone(),
+            "imu",
+            row_groups.clone(),
+            range_audit.as_ref(),
+            audit_report.as_ref(),
+        );
+        if let Err(err) = write_manifest(&path, &manifest) {
+            eprintln!("manifest write failed: {err}");
+            return ExitCode::from(1);
+        }
+        println!("manifest_out={path}");
+    }
     if let Some(files) = tensor_npy_files {
         println!("tensor_values_npy={}", files.values_path.display());
         println!("tensor_timestamps_npy={}", files.timestamps_path.display());
@@ -701,6 +1390,12 @@ fn parse_usize_arg(args: &[String], name: &str) -> Option<usize> {
         .and_then(|pair| pair[1].parse::<usize>().ok())
 }
 
+fn parse_u64_arg(args: &[String], name: &str) -> Option<u64> {
+    args.windows(2)
+        .find(|pair| pair[0] == name)
+        .and_then(|pair| pair[1].parse::<u64>().ok())
+}
+
 fn parse_i64_arg(args: &[String], name: &str) -> Option<i64> {
     args.windows(2)
         .find(|pair| pair[0] == name)
@@ -719,6 +1414,10 @@ fn parse_string_arg(args: &[String], name: &str) -> Option<String> {
         .map(|pair| pair[1].clone())
 }
 
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|arg| arg == name)
+}
+
 fn parse_u32_csv(raw: &str, name: &str) -> std::result::Result<Vec<u32>, String> {
     let values = raw
         .split(',')
@@ -733,6 +1432,79 @@ fn parse_u32_csv(raw: &str, name: &str) -> std::result::Result<Vec<u32>, String>
         return Err(format!("{name} must contain at least one row group id"));
     }
     Ok(values)
+}
+
+fn parse_row_group_ranges(
+    raw: &str,
+    name: &str,
+) -> std::result::Result<Vec<RowGroupRange>, String> {
+    let ranges = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let fields = part.split(':').collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(format!(
+                    "{name} entries must be row_group_id:byte_offset:byte_length"
+                ));
+            }
+            let row_group_id = fields[0].parse::<u32>().map_err(|err| {
+                format!("{name} contains invalid row group {:?}: {err}", fields[0])
+            })?;
+            let offset = fields[1]
+                .parse::<u64>()
+                .map_err(|err| format!("{name} contains invalid offset {:?}: {err}", fields[1]))?;
+            let length = fields[2]
+                .parse::<u64>()
+                .map_err(|err| format!("{name} contains invalid length {:?}: {err}", fields[2]))?;
+            Ok(RowGroupRange {
+                row_group_id,
+                offset,
+                length,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if ranges.is_empty() {
+        return Err(format!("{name} must contain at least one range"));
+    }
+    Ok(ranges)
+}
+
+fn print_range_audit(range_audit: &Option<RangeAudit>) {
+    if let Some(range_audit) = range_audit {
+        println!("planned_range_reads={}", range_audit.planned_range_reads());
+        println!("planned_read_bytes={}", range_audit.planned_read_bytes);
+        println!("range_audit_passed=true");
+    }
+}
+
+fn print_audit_report(audit_report: &Option<RangeAuditReport>) {
+    if let Some(report) = audit_report {
+        println!("range_enforced={}", report.enforcement_enabled);
+        println!("footer_allowance_bytes={}", report.footer_allowance_bytes);
+        println!("actual_cold_reads={}", report.actual_read_count());
+        println!("actual_cold_read_bytes={}", report.actual_read_bytes());
+        println!("actual_authorized_bytes={}", report.actual_authorized_bytes);
+        println!("materialized_bytes={}", report.materialized_bytes);
+        println!("footer_bytes={}", report.footer_bytes);
+        println!("largest_metadata_read={}", report.largest_metadata_read);
+        println!("max_footer_read_offset={}", report.max_footer_read_offset);
+        println!("max_footer_read_end={}", report.max_footer_read_end);
+        println!("range_violations={}", report.violations.len());
+    } else {
+        println!("range_enforced=false");
+    }
+}
+
+fn write_manifest(path: &str, manifest: &SeekManifest) -> robotics_core::Result<()> {
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+    }
+    let json = manifest.to_json_pretty()?;
+    std::fs::write(path, json).map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))
 }
 
 fn parse_bbox_value(raw: &str, name: &str) -> std::result::Result<BoundingBox, String> {
@@ -770,10 +1542,32 @@ fn default_demo_bbox() -> BoundingBox {
     }
 }
 
+fn pose_quaternion_inversions(samples: &[PoseSample]) -> usize {
+    let mut sorted = samples.to_vec();
+    sorted.sort_by_key(|sample| sample.timestamp_ns);
+    sorted
+        .windows(2)
+        .filter(|pair| {
+            pair[0].qw * pair[1].qw
+                + pair[0].qx * pair[1].qx
+                + pair[0].qy * pair[1].qy
+                + pair[0].qz * pair[1].qz
+                < 0.0
+        })
+        .count()
+}
+
 fn print_help() {
     println!("robotics commands:");
     println!("  robotics catalog fake --sessions 50000");
-    println!("  robotics catalog build --input data/parquet/synthetic/session.parquet --out data/catalog/fleet_metadata.parquet");
+    println!("  robotics catalog build --input data/parquet/synthetic/session.parquet --out data/catalog/fleet_metadata.parquet --gap-threshold-ns 500000000");
+    println!("  robotics catalog build-imu --input data/parquet/euroc/V1_01_easy/imu.parquet --out data/catalog/euroc_v1_01_easy_imu.parquet --gap-threshold-ns 50000000");
+    println!("  robotics catalog build-media --input data/parquet/camera/cam0.parquet --out data/catalog/cam0_media.parquet --modality camera --stream-id cam0");
+    println!("  robotics catalog duckdb-build --pose-catalog data/catalog/fleet_metadata.parquet --imu-catalog data/catalog/euroc_v1_01_easy_imu.parquet --out data/catalog/fleet.duckdb");
+    println!(
+        "  robotics catalog fake-duckdb --sessions 100000 --out data/catalog/fake_fleet.duckdb"
+    );
+    println!("  robotics catalog explain --catalog-db data/catalog/fake_fleet.duckdb --predicate 'velocity_magnitude > 5.0'");
     println!(
         "  robotics ingest synthetic-mcap --out data/mcap/synthetic/session.mcap --topic /pose"
     );
@@ -781,13 +1575,17 @@ fn print_help() {
     println!("  robotics ingest mcap-pose --input path/to/poses.mcap --out data/parquet/mcap/pose.parquet --topic /pose");
     println!("  robotics ingest kitti-oxts --input path/to/drive_or_oxts --out data/parquet/kitti/oxts.parquet");
     println!("  robotics ingest nuscenes-ego --input path/to/v1.0-mini --out data/parquet/nuscenes/ego_pose.parquet");
+    println!("  robotics ingest euroc-groundtruth --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/pose.parquet --session-id V1_01_easy");
+    println!("  robotics ingest euroc-imu --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/imu.parquet --session-id V1_01_easy");
     println!("  robotics ingest synthetic-parquet --out data/parquet/synthetic/session.parquet --row-group-rows 100");
     println!("  robotics index parquet --input data/parquet/synthetic/session.parquet");
     println!(
         "  robotics range-read parquet --input data/parquet/synthetic/session.parquet --limit 1"
     );
     println!("  robotics validate s3-parquet --input data/parquet/synthetic/session.parquet --uri s3://bucket/session.parquet --limit 1");
-    println!("  robotics tensor parquet-row-groups --input data/parquet/synthetic/session.parquet --row-groups 0 --start-ts-ns 0 --end-ts-ns 480000000 --out data/tensor/query");
+    println!("  robotics object-store put --input data/parquet/synthetic/session.parquet --uri s3://bucket/session.parquet");
+    println!("  robotics tensor parquet-row-groups --input data/parquet/synthetic/session.parquet --row-groups 0 --start-ts-ns 0 --end-ts-ns 480000000 --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query.manifest.json --out data/tensor/query");
+    println!("  robotics tensor imu-parquet-row-groups --input data/parquet/euroc/V1_01_easy/imu.parquet --row-groups 0 --timestamps-npy data/tensor/query.timestamps_ns.npy --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query_imu.manifest.json --out data/tensor/query_imu");
     println!("  robotics demo --out data/parquet/demo/session.parquet --row-group-rows 25 --bbox -0.1,2.0,-1.1,1.1,-0.1,0.1 --tensor-out data/tensor/demo");
     println!("  robotics demo fake");
 }

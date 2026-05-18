@@ -1,5 +1,6 @@
 use robotics_catalog::{
-    generate_fake_catalog, index_parquet_file, query_catalog, FakeCatalogConfig,
+    generate_fake_catalog, index_parquet_file, index_parquet_file_with_uri, query_catalog,
+    write_catalog_parquet, FakeCatalogConfig,
 };
 use robotics_core::QuerySpec;
 use robotics_ingest::{generate_synthetic_pose, write_synthetic_parquet, SyntheticConfig};
@@ -147,6 +148,14 @@ fn catalog_build_and_tensor_command_run() {
     ));
     let tensor_prefix =
         std::env::temp_dir().join(format!("robotics_cli_{}_query_tensor", std::process::id()));
+    let enforced_tensor_prefix = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_query_tensor_enforced",
+        std::process::id()
+    ));
+    let manifest_path = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_query_manifest.json",
+        std::process::id()
+    ));
 
     write_synthetic_parquet(
         &source,
@@ -209,6 +218,80 @@ fn catalog_build_and_tensor_command_run() {
     let stdout = String::from_utf8_lossy(&tensor_output.stdout);
     assert!(stdout.contains("tensor_shape=[15, 10]"));
 
+    let indexed_entries = index_parquet_file(&source).unwrap();
+    let first_entry = indexed_entries.first().unwrap();
+    let audit_ranges = format!(
+        "{}:{}:{}",
+        first_entry.row_group_id, first_entry.byte_offset, first_entry.byte_length
+    );
+    let enforced_output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "tensor",
+            "parquet-row-groups",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--row-groups",
+            "0",
+            "--start-ts-ns",
+            "0",
+            "--end-ts-ns",
+            "480000000",
+            "--hz",
+            "30",
+            "--out",
+            enforced_tensor_prefix
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+            "--audit-ranges",
+            &audit_ranges,
+            "--enforce-ranges",
+            "--footer-allowance-bytes",
+            "16777216",
+            "--manifest-out",
+            manifest_path
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("enforced tensor command should run");
+
+    assert!(
+        enforced_output.status.success(),
+        "enforced tensor command failed: {}",
+        String::from_utf8_lossy(&enforced_output.stderr)
+    );
+    let enforced_stdout = String::from_utf8_lossy(&enforced_output.stdout);
+    assert!(enforced_stdout.contains("range_enforced=true"));
+    assert!(enforced_stdout.contains("footer_allowance_bytes=16777216"));
+    assert!(std::fs::read_to_string(&manifest_path)
+        .unwrap()
+        .contains("\"footer_allowance_bytes\": 16777216"));
+    let low_allowance_output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "tensor",
+            "parquet-row-groups",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--row-groups",
+            "0",
+            "--start-ts-ns",
+            "0",
+            "--end-ts-ns",
+            "480000000",
+            "--audit-ranges",
+            &audit_ranges,
+            "--enforce-ranges",
+            "--footer-allowance-bytes",
+            "1",
+        ])
+        .output()
+        .expect("low allowance tensor command should run");
+
+    assert!(!low_allowance_output.status.success());
+    let low_allowance_stderr = String::from_utf8_lossy(&low_allowance_output.stderr);
+    assert!(low_allowance_stderr.contains("footer_allowance_bytes=1"));
+    assert!(low_allowance_stderr.contains("authorized_ranges="));
+
     let values_path = tensor_prefix.with_file_name(format!(
         "{}.values.npy",
         tensor_prefix.file_name().unwrap().to_string_lossy()
@@ -228,4 +311,182 @@ fn catalog_build_and_tensor_command_run() {
     std::fs::remove_file(catalog).ok();
     std::fs::remove_file(values_path).ok();
     std::fs::remove_file(timestamps_path).ok();
+    std::fs::remove_file(manifest_path).ok();
+    std::fs::remove_file(enforced_tensor_prefix.with_file_name(format!(
+        "{}.values.npy",
+        enforced_tensor_prefix
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    )))
+    .ok();
+    std::fs::remove_file(enforced_tensor_prefix.with_file_name(format!(
+        "{}.timestamps_ns.npy",
+        enforced_tensor_prefix
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+    )))
+    .ok();
+}
+
+#[test]
+fn catalog_duckdb_build_command_creates_persistent_tables() {
+    if !python_duckdb_available() {
+        eprintln!("skipping DuckDB catalog build test because python duckdb is not installed");
+        return;
+    }
+
+    let source = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_duckdb_source.parquet",
+        std::process::id()
+    ));
+    let catalog = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_duckdb_catalog.parquet",
+        std::process::id()
+    ));
+    let media_catalog = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_media_catalog.parquet",
+        std::process::id()
+    ));
+    let catalog_db =
+        std::env::temp_dir().join(format!("robotics_cli_{}_fleet.duckdb", std::process::id()));
+
+    write_synthetic_parquet(
+        &source,
+        "humanoid_01",
+        "session_cli",
+        SyntheticConfig {
+            hz: 50.0,
+            duration_ns: 1_000_000_000,
+            start_ts_ns: 0,
+        },
+        25,
+    )
+    .unwrap();
+    let entries =
+        index_parquet_file_with_uri(&source, format!("file://{}", source.display())).unwrap();
+    write_catalog_parquet(&catalog, &entries).unwrap();
+    let media_output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "catalog",
+            "build-media",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--out",
+            media_catalog
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+            "--modality",
+            "camera",
+            "--stream-id",
+            "cam0",
+            "--uri",
+            "file:///tmp/cam0.parquet",
+        ])
+        .output()
+        .expect("catalog build-media should run");
+    assert!(
+        media_output.status.success(),
+        "catalog build-media failed: {}",
+        String::from_utf8_lossy(&media_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&media_output.stdout).contains("indexed_row_groups=3"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "catalog",
+            "duckdb-build",
+            "--pose-catalog",
+            catalog.to_str().expect("temp path should be valid UTF-8"),
+            "--media-catalog",
+            media_catalog
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+            "--out",
+            catalog_db
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("catalog duckdb-build should run");
+
+    assert!(
+        output.status.success(),
+        "catalog duckdb-build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("pose_row_groups=3"));
+    assert!(stdout.contains("imu_row_groups=0"));
+    assert!(stdout.contains("media_row_groups=3"));
+    assert!(std::fs::metadata(&catalog_db).unwrap().len() > 0);
+    let schema_output = Command::new("python3")
+        .args([
+            "-c",
+            "import duckdb, sys; con=duckdb.connect(sys.argv[1]); print(con.execute(\"SELECT count(center_x), count(tile_min_x) FROM pose_row_groups\").fetchone())",
+            catalog_db
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("python duckdb schema check should run");
+    assert!(
+        schema_output.status.success(),
+        "DuckDB schema check failed: {}",
+        String::from_utf8_lossy(&schema_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&schema_output.stdout).contains("(3, 3)"));
+
+    std::fs::remove_file(source).ok();
+    std::fs::remove_file(catalog).ok();
+    std::fs::remove_file(media_catalog).ok();
+    std::fs::remove_file(&catalog_db).ok();
+    std::fs::remove_file(catalog_db.with_extension("duckdb.wal")).ok();
+}
+
+#[test]
+fn catalog_fake_duckdb_command_creates_large_demo_catalog() {
+    if !python_duckdb_available() {
+        eprintln!("skipping fake DuckDB catalog test because python duckdb is not installed");
+        return;
+    }
+
+    let catalog_db = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_fake_fleet.duckdb",
+        std::process::id()
+    ));
+    let output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "catalog",
+            "fake-duckdb",
+            "--sessions",
+            "128",
+            "--out",
+            catalog_db
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("catalog fake-duckdb should run");
+
+    assert!(
+        output.status.success(),
+        "catalog fake-duckdb failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("pose_row_groups=128"));
+    assert!(stdout.contains("fake_sessions=128"));
+    assert!(std::fs::metadata(&catalog_db).unwrap().len() > 0);
+
+    std::fs::remove_file(&catalog_db).ok();
+    std::fs::remove_file(catalog_db.with_extension("duckdb.wal")).ok();
+}
+
+fn python_duckdb_available() -> bool {
+    Command::new("python3")
+        .args(["-c", "import duckdb"])
+        .status()
+        .is_ok_and(|status| status.success())
 }
