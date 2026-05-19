@@ -17,5 +17,5 @@ robotics-core = { path = "../robotics-core" }
 robotics-ingest = { path = "../robotics-ingest" }
 robotics-query = { path = "../robotics-query" }
 robotics-tensor = { path = "../robotics-tensor" }
+serde_json = "1.0.145"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
-

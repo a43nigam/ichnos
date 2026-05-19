@@ -115,14 +115,18 @@ pub fn generate_fake_catalog(config: FakeCatalogConfig) -> Vec<CatalogEntry> {
 
     for i in 0..config.sessions {
         let robot_index = i % robot_count;
+        let robot_session_index = i / robot_count;
         let start_ts_ns = config.start_ts_ns + (i as i64 * config.session_duration_ns);
         let end_ts_ns = start_ts_ns + config.session_duration_ns;
-        let phase = (i % 100) as f64;
-        let min_x = -50.0 + phase * 0.25;
-        let max_x = min_x + 30.0 + (robot_index as f64 % 5.0);
-        let min_y = -25.0 + (robot_index as f64);
-        let max_y = min_y + 20.0;
-        let max_velocity = 2.0 + (i % 9) as f64;
+        let x_bucket = ((robot_session_index * 13 + robot_index * 13) % 90) as f64;
+        let y_bucket = ((robot_session_index * 7 + robot_index * 5) % 64) as f64;
+        let width_m = 1.25 + (robot_index % 4) as f64 * 0.25;
+        let height_m = 1.25 + (robot_session_index % 4) as f64 * 0.25;
+        let min_x = -72.0 + x_bucket * 1.5;
+        let max_x = min_x + width_m;
+        let min_y = -42.0 + y_bucket * 1.0;
+        let max_y = min_y + height_m;
+        let max_velocity = 1.0 + (i % 12) as f64;
 
         entries.push(CatalogEntry {
             robot_id: format!("humanoid_{:02}", robot_index + 1),
@@ -1297,6 +1301,53 @@ mod tests {
 
         std::fs::remove_file(source_path).ok();
         std::fs::remove_file(catalog_path).ok();
+    }
+
+    #[test]
+    fn indexes_euroc_camera_media_catalog() {
+        let root = std::env::temp_dir().join(format!(
+            "robotics_catalog_{}_euroc_camera",
+            std::process::id()
+        ));
+        let cam_data_dir = root.join("mav0").join("cam0").join("data");
+        let source_path = root.join("cam0.parquet");
+        std::fs::create_dir_all(&cam_data_dir).unwrap();
+        std::fs::write(cam_data_dir.join("100.png"), b"frame100").unwrap();
+        std::fs::write(cam_data_dir.join("200.png"), b"frame200").unwrap();
+        std::fs::write(
+            root.join("mav0").join("cam0").join("data.csv"),
+            "#timestamp [ns],filename\n100,100.png\n200,200.png\n",
+        )
+        .unwrap();
+        robotics_ingest::write_euroc_camera_to_parquet(
+            &root,
+            &source_path,
+            &robotics_ingest::EurocConfig {
+                robot_id: "mav0".to_string(),
+                session_id: "V1_01_easy".to_string(),
+            },
+            "cam0",
+            1,
+        )
+        .unwrap();
+
+        let entries = index_media_parquet_file_with_uri(
+            &source_path,
+            "file:///tmp/euroc/cam0.parquet",
+            "camera",
+            "cam0",
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].robot_id, "mav0");
+        assert_eq!(entries[0].session_id, "V1_01_easy");
+        assert_eq!(entries[0].start_ts_ns, 100);
+        assert_eq!(entries[0].row_count, 1);
+        assert!(entries[0].byte_length > 0);
+        assert_eq!(entries[0].min_x, None);
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn pose_sample_at(timestamp_ns: i64, value: f64) -> PoseSample {

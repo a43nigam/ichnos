@@ -3,7 +3,10 @@ use robotics_catalog::{
     write_catalog_parquet, FakeCatalogConfig,
 };
 use robotics_core::QuerySpec;
-use robotics_ingest::{generate_synthetic_pose, write_synthetic_parquet, SyntheticConfig};
+use robotics_ingest::{
+    generate_synthetic_pose, write_camera_parquet, write_synthetic_parquet, CameraFrame,
+    SyntheticConfig,
+};
 use robotics_query::{account_reads, plan_range_reads};
 use robotics_tensor::tensorize;
 use std::process::Command;
@@ -331,6 +334,95 @@ fn catalog_build_and_tensor_command_run() {
 }
 
 #[test]
+fn camera_media_row_groups_command_writes_selected_frames() {
+    let source = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_camera_source.parquet",
+        std::process::id()
+    ));
+    let out_dir =
+        std::env::temp_dir().join(format!("robotics_cli_{}_camera_frames", std::process::id()));
+    let manifest_path = std::env::temp_dir().join(format!(
+        "robotics_cli_{}_camera_manifest.json",
+        std::process::id()
+    ));
+    let frames = vec![
+        CameraFrame {
+            timestamp_ns: 100,
+            robot_id: "mav0".to_string(),
+            session_id: "room1".to_string(),
+            stream_id: "cam0".to_string(),
+            frame_path: "100.png".to_string(),
+            camera_bytes: b"frame100".to_vec(),
+        },
+        CameraFrame {
+            timestamp_ns: 200,
+            robot_id: "mav0".to_string(),
+            session_id: "room1".to_string(),
+            stream_id: "cam0".to_string(),
+            frame_path: "200.png".to_string(),
+            camera_bytes: b"frame200".to_vec(),
+        },
+    ];
+    write_camera_parquet(&source, &frames, 1).unwrap();
+    let entries = robotics_catalog::index_media_parquet_file_with_uri(
+        &source,
+        format!("file://{}", source.display()),
+        "camera",
+        "cam0",
+    )
+    .unwrap();
+    let second = &entries[1];
+    let audit_ranges = format!(
+        "{}:{}:{}",
+        second.row_group_id, second.byte_offset, second.byte_length
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_robotics"))
+        .args([
+            "media",
+            "camera-row-groups",
+            "--input",
+            source.to_str().expect("temp path should be valid UTF-8"),
+            "--row-groups",
+            "1",
+            "--out",
+            out_dir.to_str().expect("temp path should be valid UTF-8"),
+            "--audit-ranges",
+            &audit_ranges,
+            "--enforce-ranges",
+            "--footer-allowance-bytes",
+            "16777216",
+            "--manifest-out",
+            manifest_path
+                .to_str()
+                .expect("temp path should be valid UTF-8"),
+        ])
+        .output()
+        .expect("camera media command should run");
+
+    assert!(
+        output.status.success(),
+        "camera media command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("media_frames=1"));
+    assert!(stdout.contains("range_enforced=true"));
+    assert_eq!(
+        std::fs::read(out_dir.join("cam0").join("200.png")).unwrap(),
+        b"frame200"
+    );
+    assert!(!out_dir.join("cam0").join("100.png").exists());
+    let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    assert!(manifest.contains("\"timestamp_ns\": 200"));
+    assert!(manifest.contains("\"footer_allowance_bytes\": 16777216"));
+
+    std::fs::remove_file(source).ok();
+    std::fs::remove_file(manifest_path).ok();
+    std::fs::remove_dir_all(out_dir).ok();
+}
+
+#[test]
 fn catalog_duckdb_build_command_creates_persistent_tables() {
     if !python_duckdb_available() {
         eprintln!("skipping DuckDB catalog build test because python duckdb is not installed");
@@ -420,11 +512,12 @@ fn catalog_duckdb_build_command_creates_persistent_tables() {
     assert!(stdout.contains("pose_row_groups=3"));
     assert!(stdout.contains("imu_row_groups=0"));
     assert!(stdout.contains("media_row_groups=3"));
+    assert!(stdout.contains("spatial_index=tile"));
     assert!(std::fs::metadata(&catalog_db).unwrap().len() > 0);
     let schema_output = Command::new("python3")
         .args([
             "-c",
-            "import duckdb, sys; con=duckdb.connect(sys.argv[1]); print(con.execute(\"SELECT count(center_x), count(tile_min_x) FROM pose_row_groups\").fetchone())",
+            "import duckdb, sys; con=duckdb.connect(sys.argv[1]); print(con.execute(\"SELECT count(center_x), count(tile_min_x), count(hilbert_xy), count(time_bucket_ns) FROM pose_row_groups\").fetchone())",
             catalog_db
                 .to_str()
                 .expect("temp path should be valid UTF-8"),
@@ -436,7 +529,7 @@ fn catalog_duckdb_build_command_creates_persistent_tables() {
         "DuckDB schema check failed: {}",
         String::from_utf8_lossy(&schema_output.stderr)
     );
-    assert!(String::from_utf8_lossy(&schema_output.stdout).contains("(3, 3)"));
+    assert!(String::from_utf8_lossy(&schema_output.stdout).contains("(3, 3, 3, 3)"));
 
     std::fs::remove_file(source).ok();
     std::fs::remove_file(catalog).ok();
@@ -478,6 +571,7 @@ fn catalog_fake_duckdb_command_creates_large_demo_catalog() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("pose_row_groups=128"));
     assert!(stdout.contains("fake_sessions=128"));
+    assert!(stdout.contains("spatial_index=hilbert"));
     assert!(std::fs::metadata(&catalog_db).unwrap().len() > 0);
 
     std::fs::remove_file(&catalog_db).ok();
