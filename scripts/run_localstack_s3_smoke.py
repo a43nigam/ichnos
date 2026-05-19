@@ -21,6 +21,16 @@ def main() -> int:
     parser.add_argument("--timeout-sec", type=float, default=60.0)
     parser.add_argument("--skip-start", action="store_true", help="Use an already-running LocalStack endpoint.")
     parser.add_argument("--large-range-smoke", action="store_true", help="Also run the larger range validator.")
+    parser.add_argument(
+        "--vicon-room1",
+        action="store_true",
+        help="Also run the full three-sequence EuRoC Vicon Room 1 validator through LocalStack S3.",
+    )
+    parser.add_argument("--vicon-input-root", default="vicon_room1")
+    parser.add_argument("--vicon-output-root", default="data/validation/euroc_vicon_room1_s3")
+    parser.add_argument("--vicon-s3-prefix", default="")
+    parser.add_argument("--vicon-iterations", type=int, default=5)
+    parser.add_argument("--vicon-rebuild", action="store_true")
     args = parser.parse_args()
 
     if not args.skip_start:
@@ -48,6 +58,23 @@ def main() -> int:
             ],
             env=env,
         )
+    if args.vicon_room1:
+        s3_prefix = args.vicon_s3_prefix or f"s3://{args.bucket}/euroc-vicon-room1"
+        command = [
+            sys.executable,
+            "scripts/validate_euroc_vicon_room1.py",
+            "--input-root",
+            args.vicon_input_root,
+            "--output-root",
+            args.vicon_output_root,
+            "--s3-prefix",
+            s3_prefix,
+            "--iterations",
+            str(args.vicon_iterations),
+        ]
+        if args.vicon_rebuild:
+            command.append("--rebuild")
+        run(command, env=env)
     print("localstack_s3_smoke=passed")
     return 0
 
