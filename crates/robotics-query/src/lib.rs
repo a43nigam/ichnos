@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Float64Array, Int64Array, LargeBinaryArray, RecordBatch, StringArray};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::TryStreamExt;
@@ -50,6 +50,16 @@ pub struct RowGroupRange {
     pub row_group_id: u32,
     pub offset: u64,
     pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraFrame {
+    pub timestamp_ns: i64,
+    pub robot_id: String,
+    pub session_id: String,
+    pub stream_id: String,
+    pub frame_path: String,
+    pub camera_bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,6 +556,83 @@ pub async fn read_imu_parquet_row_groups_from_uri(
     Ok(samples)
 }
 
+pub async fn read_camera_parquet_row_groups_from_uri(
+    uri: &str,
+    row_group_ids: &[u32],
+) -> Result<Vec<CameraFrame>> {
+    if row_group_ids.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+
+    let (store, path) = object_store_for_uri(uri)?;
+    let store: Arc<dyn ObjectStore> = store.into();
+    let object_reader = ParquetObjectReader::new(store, path);
+    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let row_groups = normalize_row_group_ids(row_group_ids, builder.metadata().num_row_groups())?;
+    let batches = builder
+        .with_row_groups(row_groups)
+        .build()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut frames = Vec::new();
+    for batch in batches {
+        frames.extend(camera_frames_from_batch(&batch)?);
+    }
+    if frames.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    frames.sort_by_key(|frame| frame.timestamp_ns);
+    Ok(frames)
+}
+
+pub async fn read_camera_parquet_row_groups_from_uri_enforced(
+    uri: &str,
+    row_group_ids: &[u32],
+    audit: &RangeAudit,
+    footer_allowance_bytes: u64,
+) -> Result<(Vec<CameraFrame>, RangeAuditReport)> {
+    if row_group_ids.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+
+    let auditor = RangeAuditor::for_audit_with_footer_allowance(audit, footer_allowance_bytes);
+    let (store, path) = object_store_for_uri(uri)?;
+    let store: Arc<dyn ObjectStore> = store.into();
+    let meta = store
+        .head(&path)
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    auditor.set_file_size(meta.size);
+    let audited_store: Arc<dyn ObjectStore> =
+        Arc::new(AuditedObjectStore::new(store, auditor.clone()));
+    let object_reader = ParquetObjectReader::new(audited_store, path).with_file_size(meta.size);
+    let builder = ParquetRecordBatchStreamBuilder::new(object_reader)
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let row_groups = normalize_row_group_ids(row_group_ids, builder.metadata().num_row_groups())?;
+    auditor.start_materialization();
+    let batches = builder
+        .with_row_groups(row_groups)
+        .build()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut frames = Vec::new();
+    for batch in batches {
+        frames.extend(camera_frames_from_batch(&batch)?);
+    }
+    if frames.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    frames.sort_by_key(|frame| frame.timestamp_ns);
+    Ok((frames, auditor.report()))
+}
+
 pub async fn read_imu_parquet_row_groups_from_uri_enforced(
     uri: &str,
     row_group_ids: &[u32],
@@ -1000,6 +1087,29 @@ fn imu_samples_from_batch(batch: &RecordBatch) -> Result<Vec<ImuSample>> {
     Ok(samples)
 }
 
+fn camera_frames_from_batch(batch: &RecordBatch) -> Result<Vec<CameraFrame>> {
+    let timestamp_ns = int64_batch_column(batch, "timestamp_ns")?;
+    let robot_id = string_batch_column(batch, "robot_id")?;
+    let session_id = string_batch_column(batch, "session_id")?;
+    let stream_id = string_batch_column(batch, "stream_id")?;
+    let frame_path = string_batch_column(batch, "frame_path")?;
+    let camera_bytes = large_binary_batch_column(batch, "camera_bytes")?;
+    let mut frames = Vec::with_capacity(batch.num_rows());
+
+    for row in 0..batch.num_rows() {
+        frames.push(CameraFrame {
+            timestamp_ns: timestamp_ns.value(row),
+            robot_id: robot_id.value(row).to_string(),
+            session_id: session_id.value(row).to_string(),
+            stream_id: stream_id.value(row).to_string(),
+            frame_path: frame_path.value(row).to_string(),
+            camera_bytes: camera_bytes.value(row).to_vec(),
+        });
+    }
+
+    Ok(frames)
+}
+
 fn normalize_row_group_ids(row_group_ids: &[u32], row_group_count: usize) -> Result<Vec<usize>> {
     let mut row_groups = row_group_ids
         .iter()
@@ -1032,6 +1142,13 @@ fn float64_batch_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Fl
 }
 
 fn string_batch_column<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    typed_batch_column(batch, name)
+}
+
+fn large_binary_batch_column<'a>(
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a LargeBinaryArray> {
     typed_batch_column(batch, name)
 }
 
@@ -1234,6 +1351,68 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected[0].timestamp_ns, 2);
         assert_eq!(selected[0].x, 10.0);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[tokio::test]
+    async fn object_store_camera_reader_reads_only_requested_row_groups() {
+        let path = std::env::temp_dir().join(format!(
+            "robotics_query_{}_camera.parquet",
+            std::process::id()
+        ));
+        let frames = vec![
+            robotics_ingest::CameraFrame {
+                timestamp_ns: 100,
+                robot_id: "mav0".to_string(),
+                session_id: "room1".to_string(),
+                stream_id: "cam0".to_string(),
+                frame_path: "100.png".to_string(),
+                camera_bytes: b"frame100".to_vec(),
+            },
+            robotics_ingest::CameraFrame {
+                timestamp_ns: 200,
+                robot_id: "mav0".to_string(),
+                session_id: "room1".to_string(),
+                stream_id: "cam0".to_string(),
+                frame_path: "200.png".to_string(),
+                camera_bytes: b"frame200".to_vec(),
+            },
+        ];
+        robotics_ingest::write_camera_parquet(&path, &frames, 1).unwrap();
+        let entries = robotics_catalog::index_media_parquet_file_with_uri(
+            &path,
+            format!("file://{}", path.display()),
+            "camera",
+            "cam0",
+        )
+        .unwrap();
+        let audit_ranges = entries
+            .iter()
+            .filter(|entry| entry.row_group_id == 1)
+            .map(|entry| RowGroupRange {
+                row_group_id: entry.row_group_id,
+                offset: entry.byte_offset,
+                length: entry.byte_length,
+            })
+            .collect::<Vec<_>>();
+        let uri = format!("file://{}", path.display());
+        let audit = audit_row_group_range_reads(&uri, &[1], &audit_ranges).unwrap();
+
+        let (selected, report) = read_camera_parquet_row_groups_from_uri_enforced(
+            &uri,
+            &[1],
+            &audit,
+            DEFAULT_FOOTER_ALLOWANCE_BYTES,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].timestamp_ns, 200);
+        assert_eq!(selected[0].camera_bytes, b"frame200");
+        assert!(report.actual_authorized_bytes > 0);
+        assert!(report.footer_bytes > 0);
+        assert!(report.violations.is_empty());
         std::fs::remove_file(path).ok();
     }
 

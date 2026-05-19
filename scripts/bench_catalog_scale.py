@@ -19,8 +19,8 @@ from physicaldb import plan
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Benchmark hot catalog planning latency.")
-    parser.add_argument("--sessions", type=int, default=2_000)
-    parser.add_argument("--iterations", type=int, default=50)
+    parser.add_argument("--sessions", type=int, default=100_000)
+    parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--catalog-db", type=Path)
     parser.add_argument("--robot-id", default="humanoid_04")
@@ -54,6 +54,8 @@ def main() -> int:
                 "fake-duckdb",
                 "--sessions",
                 str(args.sessions),
+                "--spatial-index",
+                "hilbert",
                 "--out",
                 str(catalog_db),
             )
@@ -64,9 +66,12 @@ def main() -> int:
         print(f"warmup={args.warmup}")
         print(f"iterations={args.iterations}")
         predicates = args.predicate or [
+            "ST_Intersects(position, bbox(-49,-47,-24,-22,-2,4))",
+            "ST_Intersects(position, bbox(-70,-10,-40,20,-2,4))",
             "velocity_magnitude > 5.0 AND ST_Intersects(position, bbox(-55,-35,-30,-10,-2,4))",
             "velocity_magnitude > 8.0",
-            "ST_Intersects(position, bbox(-50,-40,-25,-15,-2,4))",
+            "time_overlap(1700010800000000000,1700014400000000000) AND velocity_magnitude > 3.0",
+            "time_overlap(1701378800000000000,1742314400000000000) AND velocity_magnitude > 4.0 AND ST_Intersects(position, bbox(-55,-35,-30,-10,-2,4))",
         ]
         failures: list[str] = []
         for index, predicate in enumerate(predicates, start=1):
@@ -95,7 +100,10 @@ def main() -> int:
             print(f"predicate_{index}_matched_row_groups={matched}")
             print(f"predicate_{index}_time_pruned_row_groups={last_plan.diagnostics.time_pruned_row_groups}")
             print(f"predicate_{index}_spatial_pruned_row_groups={last_plan.diagnostics.spatial_pruned_row_groups}")
+            print(f"predicate_{index}_hilbert_pruned_row_groups={last_plan.diagnostics.hilbert_pruned_row_groups}")
+            print(f"predicate_{index}_exact_spatial_pruned_row_groups={last_plan.diagnostics.exact_spatial_pruned_row_groups}")
             print(f"predicate_{index}_velocity_pruned_row_groups={last_plan.diagnostics.velocity_pruned_row_groups}")
+            print(f"predicate_{index}_index_strategy={last_plan.diagnostics.index_strategy}")
             print(f"predicate_{index}_prune_ratio={prune_ratio:.6f}")
             print(f"predicate_{index}_authorized_total_bytes={last_plan.authorized_total_bytes}")
             print(

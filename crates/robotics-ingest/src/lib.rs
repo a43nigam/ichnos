@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
+use arrow_array::builder::LargeBinaryBuilder;
 use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use chrono::NaiveDateTime;
@@ -91,6 +92,16 @@ pub struct NuscenesEgoConfig {
 pub struct EurocConfig {
     pub robot_id: String,
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraFrame {
+    pub timestamp_ns: i64,
+    pub robot_id: String,
+    pub session_id: String,
+    pub stream_id: String,
+    pub frame_path: String,
+    pub camera_bytes: Vec<u8>,
 }
 
 impl Default for KittiOxtsConfig {
@@ -198,6 +209,17 @@ pub fn imu_schema() -> SchemaRef {
     ]))
 }
 
+pub fn camera_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("timestamp_ns", DataType::Int64, false),
+        Field::new("robot_id", DataType::Utf8, false),
+        Field::new("session_id", DataType::Utf8, false),
+        Field::new("stream_id", DataType::Utf8, false),
+        Field::new("frame_path", DataType::Utf8, false),
+        Field::new("camera_bytes", DataType::LargeBinary, false),
+    ]))
+}
+
 pub fn write_pose_parquet(
     path: impl AsRef<Path>,
     samples: &[PoseSample],
@@ -271,6 +293,50 @@ pub fn write_imu_parquet(
 
     for chunk in samples.chunks(row_group_rows) {
         let batch = imu_batch(schema.clone(), chunk)?;
+        writer
+            .write(&batch)
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        writer
+            .flush()
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        row_groups += 1;
+    }
+
+    writer
+        .close()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    Ok(row_groups)
+}
+
+pub fn write_camera_parquet(
+    path: impl AsRef<Path>,
+    frames: &[CameraFrame],
+    row_group_rows: usize,
+) -> Result<usize> {
+    if frames.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    if row_group_rows == 0 {
+        return Err(RoboticsError::InvalidArgument(
+            "row_group_rows must be positive".to_string(),
+        ));
+    }
+
+    if let Some(parent) = path.as_ref().parent() {
+        std::fs::create_dir_all(parent).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    }
+
+    let file = File::create(path.as_ref()).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let schema = camera_schema();
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(row_group_rows))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut row_groups = 0;
+
+    for chunk in frames.chunks(row_group_rows) {
+        let batch = camera_batch(schema.clone(), chunk)?;
         writer
             .write(&batch)
             .map_err(|err| RoboticsError::Io(err.to_string()))?;
@@ -713,6 +779,55 @@ pub fn read_euroc_imu(input: impl AsRef<Path>, config: &EurocConfig) -> Result<V
     Ok(samples)
 }
 
+pub fn read_euroc_camera(
+    input: impl AsRef<Path>,
+    config: &EurocConfig,
+    stream_id: &str,
+) -> Result<Vec<CameraFrame>> {
+    if stream_id.is_empty() {
+        return Err(RoboticsError::InvalidArgument(
+            "stream_id must not be empty".to_string(),
+        ));
+    }
+    let csv_member = format!("mav0/{stream_id}/data.csv");
+    let bytes = read_euroc_member(input.as_ref(), &csv_member)?;
+    let reader = BufReader::new(Cursor::new(bytes));
+    let mut frames = Vec::new();
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| RoboticsError::Io(err.to_string()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts = parse_csv_parts(trimmed);
+        if parts.len() != 2 {
+            return Err(RoboticsError::InvalidArgument(format!(
+                "EuRoC camera row has {} columns, expected 2",
+                parts.len()
+            )));
+        }
+        let timestamp_ns = parse_i64_field(parts[0], "EuRoC camera timestamp")?;
+        let frame_path = parts[1].to_string();
+        let member = euroc_camera_member_path(stream_id, &frame_path);
+        let camera_bytes = read_euroc_member(input.as_ref(), &member)?;
+        frames.push(CameraFrame {
+            timestamp_ns,
+            robot_id: config.robot_id.clone(),
+            session_id: config.session_id.clone(),
+            stream_id: stream_id.to_string(),
+            frame_path,
+            camera_bytes,
+        });
+    }
+
+    if frames.is_empty() {
+        return Err(RoboticsError::EmptyInput);
+    }
+    frames.sort_by_key(|frame| frame.timestamp_ns);
+    Ok(frames)
+}
+
 pub fn write_euroc_groundtruth_to_parquet(
     input: impl AsRef<Path>,
     output: impl AsRef<Path>,
@@ -733,6 +848,18 @@ pub fn write_euroc_imu_to_parquet(
     let samples = read_euroc_imu(input, config)?;
     let row_groups = write_imu_parquet(output, &samples, row_group_rows)?;
     Ok((samples.len(), row_groups))
+}
+
+pub fn write_euroc_camera_to_parquet(
+    input: impl AsRef<Path>,
+    output: impl AsRef<Path>,
+    config: &EurocConfig,
+    stream_id: &str,
+    row_group_rows: usize,
+) -> Result<(usize, usize)> {
+    let frames = read_euroc_camera(input, config, stream_id)?;
+    let row_groups = write_camera_parquet(output, &frames, row_group_rows)?;
+    Ok((frames.len(), row_groups))
 }
 
 impl JsonPoseMessage {
@@ -1199,6 +1326,16 @@ fn resolve_euroc_zip(input: &Path) -> Result<std::path::PathBuf> {
         "EuRoC input must be an extracted sequence directory or .zip file: {}",
         input.display()
     )))
+}
+
+fn euroc_camera_member_path(stream_id: &str, frame_path: &str) -> String {
+    if frame_path.starts_with("mav0/") {
+        frame_path.to_string()
+    } else if frame_path.starts_with("data/") {
+        format!("mav0/{stream_id}/{frame_path}")
+    } else {
+        format!("mav0/{stream_id}/data/{frame_path}")
+    }
 }
 
 fn parse_csv_parts(line: &str) -> Vec<&str> {
@@ -1690,6 +1827,49 @@ fn imu_batch(schema: SchemaRef, samples: &[ImuSample]) -> Result<RecordBatch> {
         Arc::new(Float64Array::from(
             samples.iter().map(|sample| sample.gz).collect::<Vec<_>>(),
         )),
+    ];
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|err| RoboticsError::InvalidArgument(err.to_string()))
+}
+
+fn camera_batch(schema: SchemaRef, frames: &[CameraFrame]) -> Result<RecordBatch> {
+    let mut camera_bytes = LargeBinaryBuilder::new();
+    for frame in frames {
+        camera_bytes.append_value(&frame.camera_bytes);
+    }
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(Int64Array::from(
+            frames
+                .iter()
+                .map(|frame| frame.timestamp_ns)
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            frames
+                .iter()
+                .map(|frame| frame.robot_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            frames
+                .iter()
+                .map(|frame| frame.session_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            frames
+                .iter()
+                .map(|frame| frame.stream_id.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(StringArray::from(
+            frames
+                .iter()
+                .map(|frame| frame.frame_path.as_str())
+                .collect::<Vec<_>>(),
+        )),
+        Arc::new(camera_bytes.finish()),
     ];
 
     RecordBatch::try_new(schema, columns)
@@ -2219,6 +2399,48 @@ mod tests {
 
         let (samples, row_groups) =
             write_euroc_imu_to_parquet(&root, &parquet_path, &EurocConfig::default(), 1).unwrap();
+
+        assert_eq!(samples, 2);
+        assert_eq!(row_groups, 2);
+        assert!(parquet_path.metadata().unwrap().len() > 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn reads_and_converts_euroc_camera_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "robotics_euroc_{}_{}",
+            std::process::id(),
+            "camera"
+        ));
+        let cam_data_dir = root.join("mav0").join("cam0").join("data");
+        let parquet_path = root.join("cam0.parquet");
+        std::fs::create_dir_all(&cam_data_dir).unwrap();
+        std::fs::write(cam_data_dir.join("100.png"), b"fake_png_100").unwrap();
+        std::fs::write(cam_data_dir.join("200.png"), b"fake_png_200").unwrap();
+        std::fs::write(
+            root.join("mav0").join("cam0").join("data.csv"),
+            "#timestamp [ns],filename\n200,200.png\n100,100.png\n",
+        )
+        .unwrap();
+
+        let config = EurocConfig {
+            robot_id: "mav0".to_string(),
+            session_id: "V1_01_easy".to_string(),
+        };
+        let frames = read_euroc_camera(&root, &config, "cam0").unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].timestamp_ns, 100);
+        assert_eq!(frames[0].robot_id, "mav0");
+        assert_eq!(frames[0].session_id, "V1_01_easy");
+        assert_eq!(frames[0].stream_id, "cam0");
+        assert_eq!(frames[0].frame_path, "100.png");
+        assert_eq!(frames[0].camera_bytes, b"fake_png_100");
+
+        let (samples, row_groups) =
+            write_euroc_camera_to_parquet(&root, &parquet_path, &config, "cam0", 1).unwrap();
 
         assert_eq!(samples, 2);
         assert_eq!(row_groups, 2);

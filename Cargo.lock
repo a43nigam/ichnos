@@ -1590,6 +1590,7 @@ dependencies = [
  "robotics-ingest",
  "robotics-query",
  "robotics-tensor",
+ "serde_json",
  "tokio",
 ]
 

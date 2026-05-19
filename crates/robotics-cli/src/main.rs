@@ -12,18 +12,20 @@ use robotics_catalog::{
 };
 use robotics_core::{BoundingBox, PoseSample, QuerySpec};
 use robotics_ingest::{
-    generate_synthetic_pose, read_pose_parquet_row_groups, write_euroc_groundtruth_to_parquet,
-    write_euroc_imu_to_parquet, write_json_pose_mcap, write_json_pose_mcap_to_parquet,
-    write_kitti_oxts_to_parquet, write_nuscenes_ego_pose_to_parquet, write_pose_mcap_to_parquet,
-    write_pose_parquet, write_synthetic_parquet, EurocConfig, KittiOxtsConfig, McapJsonPoseConfig,
-    McapPoseConfig, NuscenesEgoConfig, SyntheticConfig,
+    generate_synthetic_pose, read_pose_parquet_row_groups, write_euroc_camera_to_parquet,
+    write_euroc_groundtruth_to_parquet, write_euroc_imu_to_parquet, write_json_pose_mcap,
+    write_json_pose_mcap_to_parquet, write_kitti_oxts_to_parquet,
+    write_nuscenes_ego_pose_to_parquet, write_pose_mcap_to_parquet, write_pose_parquet,
+    write_synthetic_parquet, EurocConfig, KittiOxtsConfig, McapJsonPoseConfig, McapPoseConfig,
+    NuscenesEgoConfig, SyntheticConfig,
 };
 use robotics_query::{
     account_reads, audit_row_group_range_reads, execute_object_store_range_reads, plan_range_reads,
-    put_object_store_file, read_imu_parquet_row_groups_from_uri,
+    put_object_store_file, read_camera_parquet_row_groups_from_uri,
+    read_camera_parquet_row_groups_from_uri_enforced, read_imu_parquet_row_groups_from_uri,
     read_imu_parquet_row_groups_from_uri_enforced, read_pose_parquet_row_groups_from_uri,
-    read_pose_parquet_row_groups_from_uri_enforced, RangeAudit, RangeAuditReport, RowGroupRange,
-    SeekManifest,
+    read_pose_parquet_row_groups_from_uri_enforced, CameraFrame, RangeAudit, RangeAuditReport,
+    RowGroupRange, SeekManifest,
 };
 use robotics_tensor::{gap_stats, read_i64_npy, tensorize, tensorize_imu, write_tensor_npy};
 
@@ -76,6 +78,9 @@ async fn main() -> ExitCode {
         Some("ingest") if args.get(2).map(String::as_str) == Some("euroc-imu") => {
             ingest_euroc_imu(&args[3..])
         }
+        Some("ingest") if args.get(2).map(String::as_str) == Some("euroc-camera") => {
+            ingest_euroc_camera(&args[3..])
+        }
         Some("index") if args.get(2).map(String::as_str) == Some("parquet") => {
             index_parquet(&args[3..])
         }
@@ -93,6 +98,9 @@ async fn main() -> ExitCode {
         }
         Some("tensor") if args.get(2).map(String::as_str) == Some("imu-parquet-row-groups") => {
             tensor_imu_parquet_row_groups(&args[3..]).await
+        }
+        Some("media") if args.get(2).map(String::as_str) == Some("camera-row-groups") => {
+            media_camera_row_groups(&args[3..]).await
         }
         Some("demo") if args.get(2).map(String::as_str) == Some("fake") => demo_fake(),
         Some("demo") => demo_parquet(&args[2..]).await,
@@ -334,6 +342,39 @@ fn ingest_euroc_imu(args: &[String]) -> ExitCode {
     }
 }
 
+fn ingest_euroc_camera(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let stream_id = parse_string_arg(args, "--stream-id").unwrap_or_else(|| "cam0".to_string());
+    let out = parse_string_arg(args, "--out")
+        .unwrap_or_else(|| format!("data/parquet/euroc/{stream_id}.parquet"));
+    let row_group_rows = parse_usize_arg(args, "--row-group-rows").unwrap_or(20);
+    let config = EurocConfig {
+        robot_id: parse_string_arg(args, "--robot-id").unwrap_or_else(|| "mav0".to_string()),
+        session_id: parse_string_arg(args, "--session-id")
+            .unwrap_or_else(|| "euroc_session".to_string()),
+    };
+
+    match write_euroc_camera_to_parquet(&input, &out, &config, &stream_id, row_group_rows) {
+        Ok((frames, row_groups)) => {
+            println!("input={input}");
+            println!("out={out}");
+            println!("robot_id={}", config.robot_id);
+            println!("session_id={}", config.session_id);
+            println!("stream_id={stream_id}");
+            println!("frames={frames}");
+            println!("row_groups={row_groups}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("EuRoC camera ingest failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn ingest_synthetic_parquet(args: &[String]) -> ExitCode {
     let out = parse_string_arg(args, "--out")
         .unwrap_or_else(|| "data/parquet/synthetic/session.parquet".to_string());
@@ -539,12 +580,15 @@ fn catalog_duckdb_build(args: &[String]) -> ExitCode {
     };
     let imu_catalog = parse_string_arg(args, "--imu-catalog");
     let media_catalog = parse_string_arg(args, "--media-catalog");
+    let spatial_index =
+        parse_string_arg(args, "--spatial-index").unwrap_or_else(|| "tile".to_string());
 
     match run_catalog_duckdb_build(
         &out,
         &pose_catalog,
         imu_catalog.as_deref(),
         media_catalog.as_deref(),
+        &spatial_index,
     ) {
         Ok(stdout) => {
             print!("{stdout}");
@@ -559,6 +603,8 @@ fn catalog_duckdb_build(args: &[String]) -> ExitCode {
 
 fn catalog_fake_duckdb(args: &[String]) -> ExitCode {
     let sessions = parse_usize_arg(args, "--sessions").unwrap_or(100_000);
+    let spatial_index =
+        parse_string_arg(args, "--spatial-index").unwrap_or_else(|| "hilbert".to_string());
     let Some(out) = parse_string_arg(args, "--out") else {
         eprintln!("missing required --out");
         return ExitCode::from(2);
@@ -570,6 +616,7 @@ fn catalog_fake_duckdb(args: &[String]) -> ExitCode {
     ));
     let catalog = generate_fake_catalog(FakeCatalogConfig {
         sessions,
+        robot_count: (sessions / 400).max(20),
         ..Default::default()
     });
     if let Err(err) = write_catalog_parquet(&temp_catalog, &catalog) {
@@ -584,6 +631,7 @@ fn catalog_fake_duckdb(args: &[String]) -> ExitCode {
             .expect("temporary catalog path should be valid UTF-8"),
         None,
         None,
+        &spatial_index,
     );
     std::fs::remove_file(&temp_catalog).ok();
 
@@ -609,8 +657,10 @@ fn catalog_explain(args: &[String]) -> ExitCode {
     let robot_id = parse_string_arg(args, "--robot-id").unwrap_or_default();
     let start_ts_ns = parse_string_arg(args, "--start-ts-ns").unwrap_or_default();
     let end_ts_ns = parse_string_arg(args, "--end-ts-ns").unwrap_or_default();
+    let json = has_flag(args, "--json");
 
     let script = r#"
+import json
 import sys
 from pathlib import Path
 
@@ -620,7 +670,7 @@ if root.exists():
 
 from physicaldb import plan
 
-catalog_db, predicate, robot_id, start_ts_ns, end_ts_ns = sys.argv[1:6]
+catalog_db, predicate, robot_id, start_ts_ns, end_ts_ns, emit_json = sys.argv[1:7]
 kwargs = {
     "catalog_db": catalog_db,
     "channels": ("pos_xyz",),
@@ -637,15 +687,37 @@ if end_ts_ns:
 
 seek_plan = plan(**kwargs)
 diag = seek_plan.diagnostics
-print(f"catalog_db={catalog_db}")
-print(f"predicate={predicate}")
-print(f"candidate_row_groups={diag.candidate_row_groups}")
-print(f"matched_row_groups={diag.matched_row_groups}")
-print(f"time_pruned_row_groups={diag.time_pruned_row_groups}")
-print(f"spatial_pruned_row_groups={diag.spatial_pruned_row_groups}")
-print(f"velocity_pruned_row_groups={diag.velocity_pruned_row_groups}")
-print(f"authorized_total_bytes={seek_plan.authorized_total_bytes}")
-print("row_groups=" + ",".join(str(row_group) for row_group in seek_plan.row_groups))
+payload = {
+    "catalog_db": catalog_db,
+    "predicate": predicate,
+    "candidate_row_groups": diag.candidate_row_groups,
+    "matched_row_groups": diag.matched_row_groups,
+    "time_pruned_row_groups": diag.time_pruned_row_groups,
+    "spatial_pruned_row_groups": diag.spatial_pruned_row_groups,
+    "hilbert_pruned_row_groups": diag.hilbert_pruned_row_groups,
+    "exact_spatial_pruned_row_groups": diag.exact_spatial_pruned_row_groups,
+    "velocity_pruned_row_groups": diag.velocity_pruned_row_groups,
+    "catalog_query_ms": diag.catalog_query_ms,
+    "pose_selected_bytes": diag.pose_selected_bytes,
+    "imu_selected_bytes": diag.imu_selected_bytes,
+    "media_selected_bytes": diag.media_selected_bytes,
+    "authorized_total_bytes": seek_plan.authorized_total_bytes,
+    "blocked_by_egress": seek_plan.blocked_by_egress,
+    "index_strategy": diag.index_strategy,
+    "row_groups": list(seek_plan.row_groups),
+}
+if emit_json == "true":
+    print(json.dumps(payload, sort_keys=True))
+else:
+    for key, value in payload.items():
+        if key == "row_groups":
+            print("row_groups=" + ",".join(str(row_group) for row_group in value))
+        elif isinstance(value, bool):
+            print(f"{key}={str(value).lower()}")
+        elif isinstance(value, float):
+            print(f"{key}={value:.3f}")
+        else:
+            print(f"{key}={value}")
 "#;
 
     let output = Command::new("python3")
@@ -657,6 +729,7 @@ print("row_groups=" + ",".join(str(row_group) for row_group in seek_plan.row_gro
             &robot_id,
             &start_ts_ns,
             &end_ts_ns,
+            if json { "true" } else { "false" },
         ])
         .output();
     match output {
@@ -680,7 +753,14 @@ fn run_catalog_duckdb_build(
     pose_catalog: &str,
     imu_catalog: Option<&str>,
     media_catalog: Option<&str>,
+    spatial_index: &str,
 ) -> std::result::Result<String, String> {
+    if !matches!(spatial_index, "tile" | "hilbert") {
+        return Err(
+            "catalog DuckDB build failed: --spatial-index must be 'tile' or 'hilbert'\n"
+                .to_string(),
+        );
+    }
     let script = r#"
 import sys
 from pathlib import Path
@@ -690,9 +770,43 @@ try:
 except ModuleNotFoundError as exc:
     raise SystemExit("duckdb Python package is required for catalog duckdb-build") from exc
 
-out, pose_catalog, imu_catalog, media_catalog = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+out, pose_catalog, imu_catalog, media_catalog, spatial_index = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 Path(out).parent.mkdir(parents=True, exist_ok=True)
 con = duckdb.connect(out)
+def hilbert_xy_key(x, y):
+    x = max(0, min(65535, int(x)))
+    y = max(0, min(65535, int(y)))
+    d = 0
+    s = 1 << 15
+    while s > 0:
+        rx = 1 if x & s else 0
+        ry = 1 if y & s else 0
+        d += s * s * ((3 * rx) ^ ry)
+        if ry == 0:
+            if rx == 1:
+                x = 65535 - x
+                y = 65535 - y
+            x, y = y, x
+        s //= 2
+    return d
+
+def quantize_xy(value):
+    return max(0, min(65535, int(value // 1) + 32768))
+
+def hilbert_center(min_x, max_x, min_y, max_y):
+    return hilbert_xy_key(quantize_xy((min_x + max_x) / 2.0), quantize_xy((min_y + max_y) / 2.0))
+
+def hilbert_minmax(min_x, max_x, min_y, max_y, which):
+    x0, x1 = sorted((quantize_xy(min_x), quantize_xy(max_x)))
+    y0, y1 = sorted((quantize_xy(min_y), quantize_xy(max_y)))
+    cell_count = (x1 - x0 + 1) * (y1 - y0 + 1)
+    if cell_count > 1024:
+        return 0 if which == "min" else (1 << 32) - 1
+    values = [hilbert_xy_key(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+    return min(values) if which == "min" else max(values)
+
+con.create_function("hilbert_center", hilbert_center, return_type="UBIGINT")
+con.create_function("hilbert_minmax", hilbert_minmax, return_type="UBIGINT")
 con.execute("""
     CREATE OR REPLACE TABLE pose_row_groups AS
     SELECT
@@ -702,7 +816,11 @@ con.execute("""
         CAST(floor(min_x) AS BIGINT) AS tile_min_x,
         CAST(floor(max_x) AS BIGINT) AS tile_max_x,
         CAST(floor(min_y) AS BIGINT) AS tile_min_y,
-        CAST(floor(max_y) AS BIGINT) AS tile_max_y
+        CAST(floor(max_y) AS BIGINT) AS tile_max_y,
+        CAST(floor(start_ts_ns / 3600000000000) * 3600000000000 AS BIGINT) AS time_bucket_ns,
+        hilbert_center(min_x, max_x, min_y, max_y) AS hilbert_xy,
+        hilbert_minmax(min_x, max_x, min_y, max_y, 'min') AS hilbert_min_xy,
+        hilbert_minmax(min_x, max_x, min_y, max_y, 'max') AS hilbert_max_xy
     FROM read_parquet(?)
 """, [pose_catalog])
 pose_count = con.execute("SELECT count(*) FROM pose_row_groups").fetchone()[0]
@@ -713,6 +831,9 @@ con.execute("CREATE INDEX IF NOT EXISTS pose_time_idx ON pose_row_groups(start_t
 con.execute("CREATE INDEX IF NOT EXISTS pose_bbox_idx ON pose_row_groups(min_x, max_x, min_y, max_y, min_z, max_z)")
 con.execute("CREATE INDEX IF NOT EXISTS pose_tile_idx ON pose_row_groups(tile_min_x, tile_max_x, tile_min_y, tile_max_y)")
 con.execute("CREATE INDEX IF NOT EXISTS pose_center_idx ON pose_row_groups(center_x, center_y)")
+if spatial_index == "hilbert":
+    con.execute("CREATE INDEX IF NOT EXISTS pose_hilbert_idx ON pose_row_groups(robot_id, time_bucket_ns, hilbert_xy)")
+    con.execute("CREATE INDEX IF NOT EXISTS pose_hilbert_range_idx ON pose_row_groups(hilbert_min_xy, hilbert_max_xy)")
 con.execute("CREATE INDEX IF NOT EXISTS pose_velocity_idx ON pose_row_groups(max_velocity)")
 
 if imu_catalog:
@@ -772,6 +893,7 @@ print(f"out={out}")
 print(f"pose_row_groups={pose_count}")
 print(f"imu_row_groups={imu_count}")
 print(f"media_row_groups={media_count}")
+print(f"spatial_index={spatial_index}")
 "#;
 
     let output = Command::new("python3")
@@ -782,6 +904,7 @@ print(f"media_row_groups={media_count}")
             pose_catalog,
             imu_catalog.unwrap_or(""),
             media_catalog.unwrap_or(""),
+            spatial_index,
         ])
         .output()
         .map_err(|err| format!("catalog DuckDB build failed to start python3: {err}"))?;
@@ -1165,6 +1288,109 @@ async fn tensor_imu_parquet_row_groups(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+async fn media_camera_row_groups(args: &[String]) -> ExitCode {
+    let Some(input) = parse_string_arg(args, "--input") else {
+        eprintln!("missing required --input");
+        return ExitCode::from(2);
+    };
+    let Some(row_groups_raw) = parse_string_arg(args, "--row-groups") else {
+        eprintln!("missing required --row-groups");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let enforce_ranges = has_flag(args, "--enforce-ranges");
+    let manifest_out = parse_string_arg(args, "--manifest-out");
+    let footer_allowance_bytes =
+        parse_u64_arg(args, "--footer-allowance-bytes").unwrap_or(16 * 1024 * 1024);
+    let row_groups = match parse_u32_csv(&row_groups_raw, "--row-groups") {
+        Ok(row_groups) => row_groups,
+        Err(err) => {
+            eprintln!("camera media argument error: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    let range_audit = match parse_string_arg(args, "--audit-ranges") {
+        Some(raw) => match parse_row_group_ranges(&raw, "--audit-ranges").and_then(|ranges| {
+            audit_row_group_range_reads(&input, &row_groups, &ranges).map_err(|err| err.to_string())
+        }) {
+            Ok(audit) => Some(audit),
+            Err(err) => {
+                eprintln!("camera media range audit failed: {err}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    if enforce_ranges && range_audit.is_none() {
+        eprintln!("--enforce-ranges requires --audit-ranges");
+        return ExitCode::from(2);
+    }
+
+    let (frames, audit_report) = if enforce_ranges {
+        match read_camera_parquet_row_groups_from_uri_enforced(
+            &input,
+            &row_groups,
+            range_audit.as_ref().expect("checked audit exists"),
+            footer_allowance_bytes,
+        )
+        .await
+        {
+            Ok((frames, report)) => (frames, Some(report)),
+            Err(err) => {
+                eprintln!("camera media row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        match read_camera_parquet_row_groups_from_uri(&input, &row_groups).await {
+            Ok(frames) => (frames, None),
+            Err(err) => {
+                eprintln!("camera media row-group load failed: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    };
+    let written_frames = match write_camera_frames(&out, &frames) {
+        Ok(written_frames) => written_frames,
+        Err(err) => {
+            eprintln!("camera media export failed: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    println!("input={input}");
+    println!("row_groups={row_groups_raw}");
+    println!("source_rows={}", frames.len());
+    println!("media_frames={}", written_frames.len());
+    println!(
+        "media_bytes={}",
+        frames
+            .iter()
+            .map(|frame| frame.camera_bytes.len() as u64)
+            .sum::<u64>()
+    );
+    print_range_audit(&range_audit);
+    print_audit_report(&audit_report);
+    if let Some(path) = manifest_out {
+        let seek_manifest = SeekManifest::new(
+            input.clone(),
+            "camera",
+            row_groups.clone(),
+            range_audit.as_ref(),
+            audit_report.as_ref(),
+        );
+        if let Err(err) = write_camera_manifest(&path, &seek_manifest, &written_frames) {
+            eprintln!("manifest write failed: {err}");
+            return ExitCode::from(1);
+        }
+        println!("manifest_out={path}");
+    }
+    ExitCode::SUCCESS
+}
+
 fn catalog_fake(args: &[String]) -> ExitCode {
     let sessions = parse_usize_arg(args, "--sessions").unwrap_or(50_000);
     let started = Instant::now();
@@ -1471,6 +1697,101 @@ fn parse_row_group_ranges(
     Ok(ranges)
 }
 
+#[derive(Debug, Clone)]
+struct WrittenCameraFrame {
+    timestamp_ns: i64,
+    stream_id: String,
+    frame_path: String,
+    output_path: String,
+    bytes: u64,
+}
+
+fn write_camera_frames(
+    out: &str,
+    frames: &[CameraFrame],
+) -> robotics_core::Result<Vec<WrittenCameraFrame>> {
+    let out = std::path::Path::new(out);
+    std::fs::create_dir_all(out)
+        .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+    let mut written = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let extension = camera_frame_extension(&frame.frame_path);
+        let stream_dir = out.join(sanitize_path_component(&frame.stream_id));
+        std::fs::create_dir_all(&stream_dir)
+            .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+        let output_path = stream_dir.join(format!("{}.{extension}", frame.timestamp_ns));
+        std::fs::write(&output_path, &frame.camera_bytes)
+            .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+        written.push(WrittenCameraFrame {
+            timestamp_ns: frame.timestamp_ns,
+            stream_id: frame.stream_id.clone(),
+            frame_path: frame.frame_path.clone(),
+            output_path: output_path.display().to_string(),
+            bytes: frame.camera_bytes.len() as u64,
+        });
+    }
+    Ok(written)
+}
+
+fn camera_frame_extension(frame_path: &str) -> String {
+    std::path::Path::new(frame_path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        })
+        .unwrap_or("bin")
+        .to_string()
+}
+
+fn sanitize_path_component(raw: &str) -> String {
+    let sanitized = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "stream".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn write_camera_manifest(
+    path: &str,
+    seek_manifest: &SeekManifest,
+    frames: &[WrittenCameraFrame],
+) -> robotics_core::Result<()> {
+    let path = std::path::Path::new(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+    }
+    let json = serde_json::json!({
+        "seek": seek_manifest,
+        "frames": frames.iter().map(|frame| {
+            serde_json::json!({
+                "timestamp_ns": frame.timestamp_ns,
+                "stream_id": &frame.stream_id,
+                "frame_path": &frame.frame_path,
+                "output_path": &frame.output_path,
+                "bytes": frame.bytes,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let raw = serde_json::to_string_pretty(&json)
+        .map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))?;
+    std::fs::write(path, raw).map_err(|err| robotics_core::RoboticsError::Io(err.to_string()))
+}
+
 fn print_range_audit(range_audit: &Option<RangeAudit>) {
     if let Some(range_audit) = range_audit {
         println!("planned_range_reads={}", range_audit.planned_range_reads());
@@ -1563,11 +1884,11 @@ fn print_help() {
     println!("  robotics catalog build --input data/parquet/synthetic/session.parquet --out data/catalog/fleet_metadata.parquet --gap-threshold-ns 500000000");
     println!("  robotics catalog build-imu --input data/parquet/euroc/V1_01_easy/imu.parquet --out data/catalog/euroc_v1_01_easy_imu.parquet --gap-threshold-ns 50000000");
     println!("  robotics catalog build-media --input data/parquet/camera/cam0.parquet --out data/catalog/cam0_media.parquet --modality camera --stream-id cam0");
-    println!("  robotics catalog duckdb-build --pose-catalog data/catalog/fleet_metadata.parquet --imu-catalog data/catalog/euroc_v1_01_easy_imu.parquet --out data/catalog/fleet.duckdb");
+    println!("  robotics catalog duckdb-build --pose-catalog data/catalog/fleet_metadata.parquet --imu-catalog data/catalog/euroc_v1_01_easy_imu.parquet --out data/catalog/fleet.duckdb --spatial-index hilbert");
     println!(
-        "  robotics catalog fake-duckdb --sessions 100000 --out data/catalog/fake_fleet.duckdb"
+        "  robotics catalog fake-duckdb --sessions 100000 --spatial-index hilbert --out data/catalog/fake_fleet.duckdb"
     );
-    println!("  robotics catalog explain --catalog-db data/catalog/fake_fleet.duckdb --predicate 'velocity_magnitude > 5.0'");
+    println!("  robotics catalog explain --catalog-db data/catalog/fake_fleet.duckdb --predicate 'velocity_magnitude > 5.0' --json");
     println!(
         "  robotics ingest synthetic-mcap --out data/mcap/synthetic/session.mcap --topic /pose"
     );
@@ -1577,6 +1898,7 @@ fn print_help() {
     println!("  robotics ingest nuscenes-ego --input path/to/v1.0-mini --out data/parquet/nuscenes/ego_pose.parquet");
     println!("  robotics ingest euroc-groundtruth --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/pose.parquet --session-id V1_01_easy");
     println!("  robotics ingest euroc-imu --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/imu.parquet --session-id V1_01_easy");
+    println!("  robotics ingest euroc-camera --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/cam0.parquet --stream-id cam0 --session-id V1_01_easy");
     println!("  robotics ingest synthetic-parquet --out data/parquet/synthetic/session.parquet --row-group-rows 100");
     println!("  robotics index parquet --input data/parquet/synthetic/session.parquet");
     println!(
@@ -1586,6 +1908,7 @@ fn print_help() {
     println!("  robotics object-store put --input data/parquet/synthetic/session.parquet --uri s3://bucket/session.parquet");
     println!("  robotics tensor parquet-row-groups --input data/parquet/synthetic/session.parquet --row-groups 0 --start-ts-ns 0 --end-ts-ns 480000000 --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query.manifest.json --out data/tensor/query");
     println!("  robotics tensor imu-parquet-row-groups --input data/parquet/euroc/V1_01_easy/imu.parquet --row-groups 0 --timestamps-npy data/tensor/query.timestamps_ns.npy --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query_imu.manifest.json --out data/tensor/query_imu");
+    println!("  robotics media camera-row-groups --input data/parquet/euroc/V1_01_easy/cam0.parquet --row-groups 0 --out data/media/query --audit-ranges 0:4096:65536 --enforce-ranges --manifest-out data/media/query.manifest.json");
     println!("  robotics demo --out data/parquet/demo/session.parquet --row-group-rows 25 --bbox -0.1,2.0,-1.1,1.1,-0.1,0.1 --tensor-out data/tensor/demo");
     println!("  robotics demo fake");
 }
