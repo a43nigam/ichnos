@@ -37,6 +37,11 @@ def main() -> int:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--max-egress-bytes", type=int, default=1_000_000_000_000)
     parser.add_argument("--footer-allowance-bytes", type=int, default=16 * 1024 * 1024)
+    parser.add_argument(
+        "--s3-prefix",
+        default="",
+        help="Optional s3://bucket/prefix for validating through S3-compatible object-store URIs.",
+    )
     parser.add_argument("--pose-row-group-rows", type=int, default=500)
     parser.add_argument("--imu-row-group-rows", type=int, default=2000)
     parser.add_argument("--camera-row-group-rows", type=int, default=20)
@@ -64,18 +69,23 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
     sequences = discover_sequences(args.input_root, args.sequence)
     if len(sequences) != 3:
         raise SystemExit(f"expected exactly three sequences, found {len(sequences)}")
+    s3_prefix = normalize_s3_prefix(args.s3_prefix) if args.s3_prefix else ""
+    if s3_prefix:
+        require_s3_env()
 
     per_sequence: list[dict[str, Any]] = []
     for session_id, input_path in sequences:
         paths = SequencePaths(args.output_root / session_id, args.stream_id)
         paths.root.mkdir(parents=True, exist_ok=True)
         ingest = build_or_reuse_sequence(args, session_id, input_path, paths)
-        catalogs = build_or_reuse_catalogs(args, paths)
+        object_store = upload_sequence_artifacts(paths, s3_prefix, session_id) if s3_prefix else {}
+        catalogs = build_or_reuse_catalogs(args, paths, object_store)
         per_sequence.append(
             {
                 "session_id": session_id,
                 "input": str(input_path),
                 "paths": paths_payload(paths),
+                "object_store": object_store,
                 "ingest": ingest,
                 "catalogs": catalogs,
                 "monotonic_sources": source_monotonicity(paths),
@@ -102,6 +112,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
         "--out",
         str(combined.catalog_db),
     )
+    combined_object_store = upload_combined_artifacts(combined, s3_prefix) if s3_prefix else {}
 
     predicate = choose_batch_predicate(combined.pose_catalog, args.robot_id)
     timings_ms: list[float] = []
@@ -167,6 +178,8 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "version": 1,
+        "storage_mode": "s3" if s3_prefix else "local",
+        "s3_prefix": s3_prefix,
         "input_root": str(args.input_root),
         "output_root": str(args.output_root),
         "robot_id": args.robot_id,
@@ -183,6 +196,7 @@ def run_validation(args: argparse.Namespace) -> dict[str, Any]:
             },
             "selected_windows": selected_windows,
             "catalogs": combined_catalog_stats(combined),
+            "object_store": combined_object_store,
         },
         "query": {
             "predicate": predicate,
@@ -323,7 +337,10 @@ def build_or_reuse_sequence(
     return outputs
 
 
-def build_or_reuse_catalogs(args: argparse.Namespace, paths: SequencePaths) -> dict[str, Any]:
+def build_or_reuse_catalogs(args: argparse.Namespace, paths: SequencePaths, object_store: dict[str, str]) -> dict[str, Any]:
+    pose_uri = object_store.get("pose_uri", paths.pose.resolve().as_uri())
+    imu_uri = object_store.get("imu_uri", paths.imu.resolve().as_uri())
+    media_uri = object_store.get("camera_uri", paths.camera.resolve().as_uri())
     commands = [
         (
             "pose",
@@ -336,7 +353,7 @@ def build_or_reuse_catalogs(args: argparse.Namespace, paths: SequencePaths) -> d
                 "--out",
                 str(paths.pose_catalog),
                 "--uri",
-                paths.pose.resolve().as_uri(),
+                pose_uri,
             ),
         ),
         (
@@ -350,7 +367,7 @@ def build_or_reuse_catalogs(args: argparse.Namespace, paths: SequencePaths) -> d
                 "--out",
                 str(paths.imu_catalog),
                 "--uri",
-                paths.imu.resolve().as_uri(),
+                imu_uri,
             ),
         ),
         (
@@ -368,13 +385,13 @@ def build_or_reuse_catalogs(args: argparse.Namespace, paths: SequencePaths) -> d
                 "--stream-id",
                 args.stream_id,
                 "--uri",
-                paths.camera.resolve().as_uri(),
+                media_uri,
             ),
         ),
     ]
     outputs: dict[str, Any] = {}
     for label, output, command in commands:
-        if args.rebuild or not output.exists():
+        if args.rebuild or object_store or not output.exists():
             completed = run_robotics(*command)
             outputs[label] = parse_cli_metrics(completed.stdout)
         else:
@@ -648,6 +665,72 @@ def combined_catalog_stats(paths: CombinedPaths) -> dict[str, Any]:
     }
 
 
+def normalize_s3_prefix(prefix: str) -> str:
+    value = prefix.rstrip("/")
+    if not value.startswith("s3://") or len(value) <= len("s3://"):
+        raise SystemExit("--s3-prefix must use s3://bucket/prefix")
+    return value
+
+
+def require_s3_env() -> None:
+    missing = [
+        name
+        for name in ("AWS_ENDPOINT", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")
+        if not os.environ.get(name)
+    ]
+    if missing:
+        raise SystemExit(f"--s3-prefix requires S3 env vars: {', '.join(missing)}")
+    os.environ.setdefault("AWS_REGION", "us-east-1")
+    os.environ.setdefault("AWS_ALLOW_HTTP", "true")
+    os.environ.setdefault("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false")
+    os.environ.setdefault("AWS_ENDPOINT_URL_S3", os.environ["AWS_ENDPOINT"])
+
+
+def upload_sequence_artifacts(paths: SequencePaths, s3_prefix: str, session_id: str) -> dict[str, str]:
+    uris = {
+        "pose_uri": f"{s3_prefix}/{session_id}/pose.parquet",
+        "imu_uri": f"{s3_prefix}/{session_id}/imu.parquet",
+        "camera_uri": f"{s3_prefix}/{session_id}/{paths.camera.name}",
+    }
+    upload(paths.pose, uris["pose_uri"])
+    upload(paths.imu, uris["imu_uri"])
+    upload(paths.camera, uris["camera_uri"])
+    return uris
+
+
+def upload_combined_artifacts(paths: CombinedPaths, s3_prefix: str) -> dict[str, str]:
+    artifacts = {
+        "combined_pose_catalog_uri": f"{s3_prefix}/combined_pose_catalog.parquet",
+        "combined_imu_catalog_uri": f"{s3_prefix}/combined_imu_catalog.parquet",
+        "combined_media_catalog_uri": f"{s3_prefix}/combined_media_catalog.parquet",
+        "catalog_db_uri": f"{s3_prefix}/fleet.duckdb",
+    }
+    upload(paths.pose_catalog, artifacts["combined_pose_catalog_uri"])
+    upload(paths.imu_catalog, artifacts["combined_imu_catalog_uri"])
+    upload(paths.media_catalog, artifacts["combined_media_catalog_uri"])
+    upload(paths.catalog_db, artifacts["catalog_db_uri"])
+    return artifacts
+
+
+def upload(input_path: Path, uri: str) -> None:
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(1, 4):
+        try:
+            run_robotics("object-store", "put", "--input", str(input_path), "--uri", uri)
+            return
+        except subprocess.CalledProcessError as exc:
+            last_error = exc
+            if attempt < 3:
+                time.sleep(float(attempt * 2))
+                continue
+    print(
+        "S3 upload failed. Verify the bucket exists and AWS_* env vars point at the intended S3-compatible endpoint.",
+        file=sys.stderr,
+    )
+    assert last_error is not None
+    raise last_error
+
+
 def paths_payload(paths: SequencePaths) -> dict[str, str]:
     return {
         "pose": str(paths.pose),
@@ -703,7 +786,15 @@ def parse_cli_metrics(stdout: str) -> dict[str, Any]:
 def run_robotics(*args: str) -> subprocess.CompletedProcess[str]:
     robotics_bin = os.environ.get("ROBOTICS_BIN")
     cmd = [robotics_bin, *args] if robotics_bin else ["cargo", "run", "-p", "robotics-cli", "--", *args]
-    return subprocess.run(cmd, check=True, text=True, capture_output=True)
+    completed = subprocess.run(cmd, text=True, capture_output=True)
+    if completed.returncode != 0:
+        sys.stderr.write(f"command failed: {' '.join(cmd)}\n")
+        if completed.stdout:
+            sys.stderr.write(completed.stdout)
+        if completed.stderr:
+            sys.stderr.write(completed.stderr)
+        completed.check_returncode()
+    return completed
 
 
 def quote_sql(value: str) -> str:
