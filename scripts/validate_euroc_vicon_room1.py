@@ -785,7 +785,15 @@ def parse_cli_metrics(stdout: str) -> dict[str, Any]:
 
 def run_robotics(*args: str) -> subprocess.CompletedProcess[str]:
     robotics_bin = os.environ.get("ROBOTICS_BIN")
-    cmd = [robotics_bin, *args] if robotics_bin else ["cargo", "run", "-p", "robotics-cli", "--", *args]
+    if robotics_bin:
+        cmd = [robotics_bin, *args]
+    else:
+        target_dir = os.environ.get("CARGO_TARGET_DIR")
+        candidate = Path(target_dir) / "debug" / "robotics" if target_dir else None
+        if candidate is not None and candidate.exists():
+            cmd = [str(candidate), *args]
+        else:
+            cmd = ["cargo", "run", "-p", "robotics-cli", "--", *args]
     completed = subprocess.run(cmd, text=True, capture_output=True)
     if completed.returncode != 0:
         sys.stderr.write(f"command failed: {' '.join(cmd)}\n")

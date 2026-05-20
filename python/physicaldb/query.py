@@ -148,6 +148,27 @@ class CorrectnessReport:
 
 
 @dataclass(frozen=True)
+class TensorCertificate:
+    channels: tuple[str, ...]
+    shape: tuple[int, ...]
+    dtype: str
+    timestamp_range_ns: tuple[int, int] | None
+    target_hz: float
+    source_uris: tuple[str, ...]
+    selected_row_groups: tuple[dict[str, object], ...]
+    units: dict[str, str]
+    frames: dict[str, str]
+    gap_counts: dict[str, int]
+    max_gaps_ns: dict[str, int]
+    range_enforcement: dict[str, object]
+    cold_read_bytes: int
+    interpolation_policy: str
+    extrapolation_status: str
+    validity_warnings: tuple[str, ...] = ()
+    benchmark: dict[str, float] | None = None
+
+
+@dataclass(frozen=True)
 class RowGroupSpan:
     modality: str
     file_uri: str
@@ -243,6 +264,7 @@ class QueryResult:
     diagnostics: CorrectnessReport
     manifest: dict[str, object] | None = None
     media_manifest: dict[str, object] | None = None
+    certificate: TensorCertificate | None = None
 
 
 @dataclass(frozen=True)
@@ -252,6 +274,7 @@ class BatchQueryResult:
     output: str
     diagnostics: CorrectnessReport
     manifest: dict[str, object] | None = None
+    certificate: TensorCertificate | None = None
 
 
 @dataclass(frozen=True)
@@ -274,6 +297,83 @@ class _CatalogExplain:
     exact_spatial_pruned_row_groups: int = 0
     velocity_pruned_row_groups: int = 0
     index_strategy: str = "none"
+
+
+def check_finite_tensor_values(values: np.ndarray) -> bool:
+    return bool(np.isfinite(values).all())
+
+
+def check_timestamp_monotonicity(timestamps_ns: np.ndarray) -> bool:
+    if timestamps_ns.size < 2:
+        return True
+    return bool(np.all(np.diff(timestamps_ns.astype(np.int64, copy=False)) >= 0))
+
+
+def check_quaternion_norms(rot_wxyz: np.ndarray, *, tolerance: float = 1e-3) -> bool:
+    if rot_wxyz.size == 0:
+        return True
+    norms = np.linalg.norm(rot_wxyz, axis=1)
+    return bool(np.all(np.abs(norms - 1.0) <= tolerance))
+
+
+def check_max_velocity(vel_xyz: np.ndarray, *, max_velocity: float) -> bool:
+    if vel_xyz.size == 0:
+        return True
+    speeds = np.linalg.norm(vel_xyz, axis=1)
+    return bool(np.all(speeds <= max_velocity))
+
+
+def linear_motion_interpolation_benchmark(sample_count: int = 11) -> dict[str, float]:
+    if sample_count < 3:
+        raise ValueError("sample_count must be >= 3")
+    source_t = np.array([0.0, 1.0])
+    source_x = np.array([0.0, 10.0])
+    target_t = np.linspace(0.0, 1.0, sample_count)
+    interpolated = np.interp(target_t, source_t, source_x)
+    expected = target_t * 10.0
+    error = np.abs(interpolated - expected)
+    return {"max_error": float(error.max()), "mean_error": float(error.mean())}
+
+
+def slerp_constant_angular_velocity_benchmark(sample_count: int = 11) -> dict[str, float]:
+    if sample_count < 3:
+        raise ValueError("sample_count must be >= 3")
+    q0 = np.array([1.0, 0.0, 0.0, 0.0])
+    q1 = _axis_angle_quaternion(np.array([0.0, 0.0, 1.0]), math.pi / 2.0)
+    target_t = np.linspace(0.0, 1.0, sample_count)
+    interpolated = np.array([_slerp(q0, q1, float(t)) for t in target_t])
+    expected = np.array([
+        _axis_angle_quaternion(np.array([0.0, 0.0, 1.0]), (math.pi / 2.0) * float(t))
+        for t in target_t
+    ])
+    dots = np.abs(np.sum(interpolated * expected, axis=1))
+    dots = np.clip(dots, -1.0, 1.0)
+    angular_error = 2.0 * np.arccos(dots)
+    return {"max_error_rad": float(angular_error.max()), "mean_error_rad": float(angular_error.mean())}
+
+
+def _axis_angle_quaternion(axis: np.ndarray, angle_rad: float) -> np.ndarray:
+    unit_axis = axis / np.linalg.norm(axis)
+    half = angle_rad / 2.0
+    return np.array([math.cos(half), *(math.sin(half) * unit_axis)], dtype=np.float64)
+
+
+def _slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:
+        result = q0 + t * (q1 - q0)
+        return result / np.linalg.norm(result)
+    theta_0 = math.acos(dot)
+    sin_theta_0 = math.sin(theta_0)
+    theta = theta_0 * t
+    s0 = math.cos(theta) - dot * math.sin(theta) / sin_theta_0
+    s1 = math.sin(theta) / sin_theta_0
+    return (s0 * q0) + (s1 * q1)
 
 
 def query(
@@ -353,6 +453,59 @@ def query(
         footer_allowance_bytes=footer_allowance_bytes,
         manifest_out=Path(manifest_out) if manifest_out is not None else None,
         predicate=predicate,
+        robotics_bin=robotics_bin,
+    )
+
+
+def query_managed_dataset(
+    output_root: str | os.PathLike[str],
+    *,
+    robot_id: str | None = None,
+    session_id: str | None = None,
+    start_ts_ns: int | None = None,
+    end_ts_ns: int | None = None,
+    bbox: Sequence[float] | None = None,
+    min_velocity: float | None = None,
+    predicate: str | None = None,
+    channels: Sequence[str] = ("pos_xyz", "rot_wxyz", "vel_xyz"),
+    target_hz: float = 30.0,
+    output: Literal["numpy", "torch"] = "numpy",
+    max_egress_bytes: int = 1_000_000_000,
+    limit: int | None = None,
+    gap_policy: Literal["reject", "allow"] = "reject",
+    enforce_ranges: bool = False,
+    footer_allowance_bytes: int = DEFAULT_FOOTER_ALLOWANCE_BYTES,
+    manifest_out: str | os.PathLike[str] | None = None,
+    materialize_media: bool = False,
+    media_out: str | os.PathLike[str] | None = None,
+    robotics_bin: str | os.PathLike[str] | None = None,
+) -> QueryResult:
+    """Query a managed dataset output root produced by dataset ingest."""
+
+    root = Path(output_root)
+    catalog_db = root / "catalog" / "dataset.duckdb"
+    if not catalog_db.exists():
+        raise FileNotFoundError(f"managed dataset catalog DB not found: {catalog_db}")
+    return query(
+        catalog_db=catalog_db,
+        robot_id=robot_id,
+        session_id=session_id,
+        start_ts_ns=start_ts_ns,
+        end_ts_ns=end_ts_ns,
+        bbox=bbox,
+        min_velocity=min_velocity,
+        predicate=predicate,
+        channels=channels,
+        target_hz=target_hz,
+        output=output,
+        max_egress_bytes=max_egress_bytes,
+        limit=limit,
+        gap_policy=gap_policy,
+        enforce_ranges=enforce_ranges,
+        footer_allowance_bytes=footer_allowance_bytes,
+        manifest_out=manifest_out,
+        materialize_media=materialize_media,
+        media_out=media_out,
         robotics_bin=robotics_bin,
     )
 
@@ -443,10 +596,12 @@ def query_batch(
         enforce_ranges=enforce_ranges,
         footer_allowance_bytes=footer_allowance_bytes,
     )
+    certificate = _aggregate_tensor_certificates(tuple(result.certificate for result in results if result.certificate is not None))
     manifest = _batch_query_manifest(
         batch_plan=batch_plan,
         results=tuple(results),
         diagnostics=diagnostics,
+        certificate=certificate,
         predicate=predicate,
         channels=channels,
         target_hz=target_hz,
@@ -464,6 +619,7 @@ def query_batch(
         output=output,
         diagnostics=diagnostics,
         manifest=manifest,
+        certificate=certificate,
     )
 
 
@@ -646,9 +802,20 @@ def _query_from_seek_plan(
     else:
         tensor = values
 
+    certificate = _build_tensor_certificate(
+        values=values,
+        timestamps=timestamps,
+        seek_plan=seek_plan,
+        diagnostics=diagnostics,
+        channels=channels,
+        target_hz=target_hz,
+        enforce_ranges=enforce_ranges,
+        footer_allowance_bytes=footer_allowance_bytes,
+    )
     manifest = _query_manifest(
         seek_plan=seek_plan,
         diagnostics=diagnostics,
+        certificate=certificate,
         pose_manifest=pose_manifest,
         imu_manifest=imu_manifest,
         media_manifest=media_manifest,
@@ -673,6 +840,7 @@ def _query_from_seek_plan(
         diagnostics=diagnostics,
         manifest=manifest,
         media_manifest=media_manifest,
+        certificate=certificate,
     )
 
 
@@ -2315,10 +2483,167 @@ def _load_json_manifest(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _build_tensor_certificate(
+    *,
+    values: np.ndarray,
+    timestamps: np.ndarray,
+    seek_plan: SeekPlan,
+    diagnostics: CorrectnessReport,
+    channels: Sequence[str],
+    target_hz: float,
+    enforce_ranges: bool,
+    footer_allowance_bytes: int,
+) -> TensorCertificate:
+    timestamp_range = None
+    if timestamps.size:
+        timestamp_range = (int(timestamps[0]), int(timestamps[-1]))
+    source_uris = tuple(
+        sorted(
+            {
+                span.file_uri
+                for span in (
+                    *seek_plan.pose_row_groups,
+                    *seek_plan.imu_row_groups,
+                    *seek_plan.media_row_groups,
+                )
+            }
+        )
+    )
+    selected_row_groups = tuple(
+        asdict(span)
+        for span in (
+            *seek_plan.pose_row_groups,
+            *seek_plan.imu_row_groups,
+            *seek_plan.media_row_groups,
+        )
+    )
+    warnings = list(_tensor_validity_warnings(values, timestamps, channels))
+    return TensorCertificate(
+        channels=tuple(channels),
+        shape=tuple(int(dim) for dim in values.shape),
+        dtype=str(values.dtype),
+        timestamp_range_ns=timestamp_range,
+        target_hz=float(target_hz),
+        source_uris=source_uris,
+        selected_row_groups=selected_row_groups,
+        units=_certificate_units(channels),
+        frames=_certificate_frames(channels),
+        gap_counts={"pose": diagnostics.pose_gap_count, "imu": diagnostics.imu_gap_count},
+        max_gaps_ns={"pose": diagnostics.pose_max_gap_ns, "imu": diagnostics.imu_max_gap_ns},
+        range_enforcement={
+            "enabled": enforce_ranges,
+            "violations": diagnostics.range_violations,
+            "footer_allowance_bytes": footer_allowance_bytes,
+            "range_audit_passed": diagnostics.range_audit_passed,
+        },
+        cold_read_bytes=diagnostics.actual_cold_read_bytes,
+        interpolation_policy="pose:linear_position+slerp_rotation; imu:nearest_or_linear_materializer",
+        extrapolation_status="rejected" if diagnostics.extrapolation_rejected else "checked",
+        validity_warnings=tuple(warnings),
+    )
+
+
+def _aggregate_tensor_certificates(certificates: Sequence[TensorCertificate]) -> TensorCertificate | None:
+    if not certificates:
+        return None
+    timestamp_ranges = [certificate.timestamp_range_ns for certificate in certificates if certificate.timestamp_range_ns]
+    timestamp_range = None
+    if timestamp_ranges:
+        timestamp_range = (
+            min(start for start, _end in timestamp_ranges),
+            max(end for _start, end in timestamp_ranges),
+        )
+    return TensorCertificate(
+        channels=certificates[0].channels,
+        shape=(sum(certificate.shape[0] for certificate in certificates), *certificates[0].shape[1:]),
+        dtype=certificates[0].dtype,
+        timestamp_range_ns=timestamp_range,
+        target_hz=certificates[0].target_hz,
+        source_uris=tuple(sorted({uri for certificate in certificates for uri in certificate.source_uris})),
+        selected_row_groups=tuple(row_group for certificate in certificates for row_group in certificate.selected_row_groups),
+        units=certificates[0].units,
+        frames=certificates[0].frames,
+        gap_counts={
+            "pose": sum(certificate.gap_counts.get("pose", 0) for certificate in certificates),
+            "imu": sum(certificate.gap_counts.get("imu", 0) for certificate in certificates),
+        },
+        max_gaps_ns={
+            "pose": max((certificate.max_gaps_ns.get("pose", 0) for certificate in certificates), default=0),
+            "imu": max((certificate.max_gaps_ns.get("imu", 0) for certificate in certificates), default=0),
+        },
+        range_enforcement={
+            "enabled": all(bool(certificate.range_enforcement.get("enabled")) for certificate in certificates),
+            "violations": sum(int(certificate.range_enforcement.get("violations", 0)) for certificate in certificates),
+            "footer_allowance_bytes": certificates[0].range_enforcement.get("footer_allowance_bytes", 0),
+            "range_audit_passed": all(
+                bool(certificate.range_enforcement.get("range_audit_passed")) for certificate in certificates
+            ),
+        },
+        cold_read_bytes=sum(certificate.cold_read_bytes for certificate in certificates),
+        interpolation_policy=certificates[0].interpolation_policy,
+        extrapolation_status="rejected"
+        if any(certificate.extrapolation_status == "rejected" for certificate in certificates)
+        else "checked",
+        validity_warnings=tuple(warning for certificate in certificates for warning in certificate.validity_warnings),
+    )
+
+
+def _tensor_validity_warnings(
+    values: np.ndarray,
+    timestamps: np.ndarray,
+    channels: Sequence[str],
+) -> tuple[str, ...]:
+    warnings: list[str] = []
+    if not check_finite_tensor_values(values):
+        warnings.append("tensor contains non-finite values")
+    if not check_timestamp_monotonicity(timestamps):
+        warnings.append("timestamps are not monotonically nondecreasing")
+    rot_offset = 0
+    for channel in channels:
+        if channel == "rot_wxyz":
+            rotations = values[:, rot_offset : rot_offset + 4]
+            if rotations.size and not check_quaternion_norms(rotations):
+                max_error = float(np.max(np.abs(np.linalg.norm(rotations, axis=1) - 1.0)))
+                warnings.append(f"quaternion norm check failed: max_error={max_error:.6g}")
+            break
+        if channel in CHANNELS:
+            rot_offset += len(CHANNELS[channel])
+    return tuple(warnings)
+
+
+def _certificate_units(channels: Sequence[str]) -> dict[str, str]:
+    units: dict[str, str] = {}
+    for channel in channels:
+        if channel == "pos_xyz":
+            units.update({"x": "m", "y": "m", "z": "m"})
+        elif channel == "rot_wxyz":
+            units.update({"qw": "1", "qx": "1", "qy": "1", "qz": "1"})
+        elif channel == "vel_xyz":
+            units.update({"vx": "m/s", "vy": "m/s", "vz": "m/s"})
+        elif channel == "imu_accel":
+            units.update({"ax": "m/s^2", "ay": "m/s^2", "az": "m/s^2"})
+        elif channel == "imu_gyro":
+            units.update({"gx": "rad/s", "gy": "rad/s", "gz": "rad/s"})
+    return units
+
+
+def _certificate_frames(channels: Sequence[str]) -> dict[str, str]:
+    frames: dict[str, str] = {}
+    for channel in channels:
+        if channel in {"pos_xyz", "rot_wxyz", "vel_xyz"}:
+            frames[channel] = "world"
+        elif channel.startswith("imu_"):
+            frames[channel] = "imu"
+        elif ":" in channel:
+            frames[channel] = channel.split(":", 1)[1]
+    return frames
+
+
 def _query_manifest(
     *,
     seek_plan: SeekPlan,
     diagnostics: CorrectnessReport,
+    certificate: TensorCertificate,
     pose_manifest: dict[str, object] | None,
     imu_manifest: dict[str, object] | None,
     media_manifest: dict[str, object] | None,
@@ -2384,6 +2709,7 @@ def _query_manifest(
             "violations": violations,
             "enforcement_enabled": enforce_ranges,
             "diagnostics": asdict(diagnostics),
+            "tensor_certificate": asdict(certificate),
             "pose_materialization_manifest": pose_manifest,
             "imu_materialization_manifest": imu_manifest,
             "media_materialization_manifest": media_manifest,
@@ -2517,6 +2843,7 @@ def _batch_query_manifest(
     batch_plan: BatchSeekPlan,
     results: Sequence[QueryResult],
     diagnostics: CorrectnessReport,
+    certificate: TensorCertificate | None,
     predicate: str | None,
     channels: Sequence[str],
     target_hz: float,
@@ -2561,6 +2888,7 @@ def _batch_query_manifest(
         "violations": violations,
         "enforcement_enabled": enforce_ranges,
         "diagnostics": asdict(diagnostics),
+        "tensor_certificate": asdict(certificate) if certificate is not None else None,
     }
 
 
