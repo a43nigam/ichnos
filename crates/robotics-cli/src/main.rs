@@ -20,12 +20,13 @@ use robotics_ingest::{
     NuscenesEgoConfig, SyntheticConfig,
 };
 use robotics_query::{
-    account_reads, audit_row_group_range_reads, execute_object_store_range_reads, plan_range_reads,
-    put_object_store_file, read_camera_parquet_row_groups_from_uri,
-    read_camera_parquet_row_groups_from_uri_enforced, read_imu_parquet_row_groups_from_uri,
-    read_imu_parquet_row_groups_from_uri_enforced, read_pose_parquet_row_groups_from_uri,
-    read_pose_parquet_row_groups_from_uri_enforced, CameraFrame, RangeAudit, RangeAuditReport,
-    RowGroupRange, SeekManifest,
+    account_reads, audit_row_group_range_reads, execute_object_store_range_reads,
+    get_object_store_file, list_object_store_prefix, plan_range_reads, put_object_store_file,
+    read_camera_parquet_row_groups_from_uri, read_camera_parquet_row_groups_from_uri_enforced,
+    read_imu_parquet_row_groups_from_uri, read_imu_parquet_row_groups_from_uri_enforced,
+    read_pose_parquet_row_groups_from_uri, read_pose_parquet_row_groups_from_uri_enforced,
+    sync_object_store_prefix, CameraFrame, RangeAudit, RangeAuditReport, RowGroupRange,
+    SeekManifest,
 };
 use robotics_tensor::{gap_stats, read_i64_npy, tensorize, tensorize_imu, write_tensor_npy};
 
@@ -81,6 +82,7 @@ async fn main() -> ExitCode {
         Some("ingest") if args.get(2).map(String::as_str) == Some("euroc-camera") => {
             ingest_euroc_camera(&args[3..])
         }
+        Some("dataset") => dataset_command(&args[2..]),
         Some("index") if args.get(2).map(String::as_str) == Some("parquet") => {
             index_parquet(&args[3..])
         }
@@ -92,6 +94,15 @@ async fn main() -> ExitCode {
         }
         Some("object-store") if args.get(2).map(String::as_str) == Some("put") => {
             object_store_put(&args[3..]).await
+        }
+        Some("object-store") if args.get(2).map(String::as_str) == Some("get") => {
+            object_store_get(&args[3..]).await
+        }
+        Some("object-store") if args.get(2).map(String::as_str) == Some("list") => {
+            object_store_list(&args[3..]).await
+        }
+        Some("object-store") if args.get(2).map(String::as_str) == Some("sync-prefix") => {
+            object_store_sync_prefix(&args[3..]).await
         }
         Some("tensor") if args.get(2).map(String::as_str) == Some("parquet-row-groups") => {
             tensor_parquet_row_groups(&args[3..]).await
@@ -112,6 +123,39 @@ async fn main() -> ExitCode {
             eprintln!("unknown command: {command}");
             print_help();
             ExitCode::from(2)
+        }
+    }
+}
+
+fn dataset_command(args: &[String]) -> ExitCode {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|path| path.parent())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(manifest_dir);
+    let python_path = repo_root.join("python");
+    let mut command = Command::new("python3");
+    command.arg("-m").arg("physicaldb.onboarding_cli");
+    command.args(args);
+    match env::var_os("PYTHONPATH") {
+        Some(existing) => {
+            let mut paths = vec![python_path];
+            paths.extend(env::split_paths(&existing));
+            if let Ok(joined) = env::join_paths(paths) {
+                command.env("PYTHONPATH", joined);
+            }
+        }
+        None => {
+            command.env("PYTHONPATH", python_path);
+        }
+    }
+    match command.status() {
+        Ok(status) if status.success() => ExitCode::SUCCESS,
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(err) => {
+            eprintln!("dataset command failed to launch python3: {err}");
+            ExitCode::from(1)
         }
     }
 }
@@ -1017,6 +1061,105 @@ async fn object_store_put(args: &[String]) -> ExitCode {
     }
 }
 
+async fn object_store_get(args: &[String]) -> ExitCode {
+    let Some(uri) = parse_string_arg(args, "--uri") else {
+        eprintln!("missing required --uri s3://bucket/key or compatible object-store URI");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+
+    match get_object_store_file(&uri, &out).await {
+        Ok(downloaded_bytes) => {
+            println!("uri={uri}");
+            println!("out={out}");
+            println!("downloaded_bytes={downloaded_bytes}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("object-store get failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn object_store_list(args: &[String]) -> ExitCode {
+    let Some(uri) = parse_string_arg(args, "--uri") else {
+        eprintln!("missing required --uri s3://bucket/prefix or compatible object-store URI");
+        return ExitCode::from(2);
+    };
+    let limit = parse_usize_arg(args, "--limit").unwrap_or(500);
+    match list_object_store_prefix(&uri, limit).await {
+        Ok(objects) => {
+            let json = serde_json::json!({
+                "uri": uri,
+                "limit": limit,
+                "object_count": objects.len(),
+                "objects": objects,
+            });
+            match serde_json::to_string_pretty(&json) {
+                Ok(raw) => {
+                    println!("{raw}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("object-store list JSON serialization failed: {err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("object-store list failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn object_store_sync_prefix(args: &[String]) -> ExitCode {
+    let Some(uri) = parse_string_arg(args, "--uri") else {
+        eprintln!("missing required --uri s3://bucket/prefix or compatible object-store URI");
+        return ExitCode::from(2);
+    };
+    let Some(out) = parse_string_arg(args, "--out") else {
+        eprintln!("missing required --out");
+        return ExitCode::from(2);
+    };
+    let limit = parse_usize_arg(args, "--limit").unwrap_or(500);
+
+    match sync_object_store_prefix(&uri, &out, limit).await {
+        Ok(downloads) => {
+            let downloaded_bytes: u64 = downloads
+                .iter()
+                .map(|download| download.downloaded_bytes)
+                .sum();
+            let json = serde_json::json!({
+                "uri": uri,
+                "out": out,
+                "limit": limit,
+                "object_count": downloads.len(),
+                "downloaded_bytes": downloaded_bytes,
+                "objects": downloads,
+            });
+            match serde_json::to_string_pretty(&json) {
+                Ok(raw) => {
+                    println!("{raw}");
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("object-store sync-prefix JSON serialization failed: {err}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Err(err) => {
+            eprintln!("object-store sync-prefix failed: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 async fn tensor_parquet_row_groups(args: &[String]) -> ExitCode {
     let Some(input) = parse_string_arg(args, "--input") else {
         eprintln!("missing required --input");
@@ -1900,12 +2043,25 @@ fn print_help() {
     println!("  robotics ingest euroc-imu --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/imu.parquet --session-id V1_01_easy");
     println!("  robotics ingest euroc-camera --input vicon_room1/V1_01_easy --out data/parquet/euroc/V1_01_easy/cam0.parquet --stream-id cam0 --session-id V1_01_easy");
     println!("  robotics ingest synthetic-parquet --out data/parquet/synthetic/session.parquet --row-group-rows 100");
+    println!("  robotics dataset adapters");
+    println!(
+        "  robotics dataset inspect --adapter auto --input path/to/dataset --out profile.json"
+    );
+    println!("  robotics dataset init-manifest --adapter auto --profile profile.json --out dataset.json --dataset-id dataset_001 --robot-id robot_001 --session-id session_001");
+    println!("  robotics dataset init-mapping --adapter generic_dataset --profile profile.json --out dataset.json");
+    println!("  robotics dataset validate --manifest dataset.json --out validation.json");
+    println!(
+        "  robotics dataset ingest --manifest dataset.json --output-root data/managed/dataset_001"
+    );
     println!("  robotics index parquet --input data/parquet/synthetic/session.parquet");
     println!(
         "  robotics range-read parquet --input data/parquet/synthetic/session.parquet --limit 1"
     );
     println!("  robotics validate s3-parquet --input data/parquet/synthetic/session.parquet --uri s3://bucket/session.parquet --limit 1");
     println!("  robotics object-store put --input data/parquet/synthetic/session.parquet --uri s3://bucket/session.parquet");
+    println!("  robotics object-store get --uri s3://bucket/session.parquet --out data/staging/session.parquet");
+    println!("  robotics object-store list --uri s3://bucket/prefix --limit 500");
+    println!("  robotics object-store sync-prefix --uri s3://bucket/prefix --out data/staging/prefix --limit 500");
     println!("  robotics tensor parquet-row-groups --input data/parquet/synthetic/session.parquet --row-groups 0 --start-ts-ns 0 --end-ts-ns 480000000 --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query.manifest.json --out data/tensor/query");
     println!("  robotics tensor imu-parquet-row-groups --input data/parquet/euroc/V1_01_easy/imu.parquet --row-groups 0 --timestamps-npy data/tensor/query.timestamps_ns.npy --audit-ranges 0:4096:65536 --enforce-ranges --footer-allowance-bytes 16777216 --manifest-out data/tensor/query_imu.manifest.json --out data/tensor/query_imu");
     println!("  robotics media camera-row-groups --input data/parquet/euroc/V1_01_easy/cam0.parquet --row-groups 0 --out data/media/query --audit-ranges 0:4096:65536 --enforce-ranges --manifest-out data/media/query.manifest.json");

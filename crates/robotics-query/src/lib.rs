@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -43,6 +43,23 @@ pub struct ByteAccounting {
 pub struct CompletedRangeRead {
     pub read: RangeRead,
     pub bytes_read: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectListing {
+    pub uri: String,
+    pub path: String,
+    pub size_bytes: u64,
+    pub last_modified: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectStoreDownload {
+    pub uri: String,
+    pub path: String,
+    pub local_path: String,
+    pub size_bytes: u64,
+    pub downloaded_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,6 +529,122 @@ pub async fn put_object_store_file(input: impl AsRef<Path>, uri: &str) -> Result
     let byte_len = bytes.len() as u64;
     put_object_store_bytes(uri, bytes).await?;
     Ok(byte_len)
+}
+
+pub async fn list_object_store_prefix(uri: &str, limit: usize) -> Result<Vec<ObjectListing>> {
+    let (store, prefix) = object_store_for_uri(uri)?;
+    let base_uri = uri.trim_end_matches('/');
+    let mut stream = store.list(Some(&prefix));
+    let mut objects = Vec::new();
+    while let Some(meta) = stream
+        .try_next()
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?
+    {
+        let path = meta.location.to_string();
+        let uri = if has_uri_scheme(base_uri) {
+            format!(
+                "{}/{}",
+                uri_root_for_listing(base_uri),
+                path.trim_start_matches('/')
+            )
+        } else {
+            path.clone()
+        };
+        objects.push(ObjectListing {
+            uri,
+            path,
+            size_bytes: meta.size as u64,
+            last_modified: meta.last_modified.to_rfc3339(),
+        });
+        if limit > 0 && objects.len() >= limit {
+            break;
+        }
+    }
+    Ok(objects)
+}
+
+pub async fn get_object_store_file(uri: &str, output: impl AsRef<Path>) -> Result<u64> {
+    let (store, path) = object_store_for_uri(uri)?;
+    download_object_store_path(&*store, &path, output.as_ref()).await
+}
+
+pub async fn sync_object_store_prefix(
+    uri: &str,
+    output_dir: impl AsRef<Path>,
+    limit: usize,
+) -> Result<Vec<ObjectStoreDownload>> {
+    let (store, prefix) = object_store_for_uri(uri)?;
+    let base_uri = uri.trim_end_matches('/');
+    let mut stream = store.list(Some(&prefix));
+    let mut downloads = Vec::new();
+
+    while let Some(meta) = stream
+        .try_next()
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?
+    {
+        let path = meta.location.to_string();
+        let relative_path = relative_object_path(&prefix, &meta.location)?;
+        let local_path = output_dir.as_ref().join(relative_path);
+        let downloaded_bytes =
+            download_object_store_path(&*store, &meta.location, &local_path).await?;
+        let uri = if has_uri_scheme(base_uri) {
+            format!(
+                "{}/{}",
+                uri_root_for_listing(base_uri),
+                path.trim_start_matches('/')
+            )
+        } else {
+            path.clone()
+        };
+        downloads.push(ObjectStoreDownload {
+            uri,
+            path,
+            local_path: local_path.display().to_string(),
+            size_bytes: meta.size as u64,
+            downloaded_bytes,
+        });
+        if limit > 0 && downloads.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(downloads)
+}
+
+async fn download_object_store_path(
+    store: &dyn ObjectStore,
+    path: &ObjectPath,
+    output: &Path,
+) -> Result<u64> {
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    }
+
+    let result = store
+        .get(path)
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut stream = result.into_stream();
+    let mut file = File::create(output).map_err(|err| RoboticsError::Io(err.to_string()))?;
+    let mut downloaded_bytes = 0;
+
+    while let Some(chunk) = stream
+        .try_next()
+        .await
+        .map_err(|err| RoboticsError::Io(err.to_string()))?
+    {
+        file.write_all(&chunk)
+            .map_err(|err| RoboticsError::Io(err.to_string()))?;
+        downloaded_bytes += chunk.len() as u64;
+    }
+    file.flush()
+        .map_err(|err| RoboticsError::Io(err.to_string()))?;
+    Ok(downloaded_bytes)
 }
 
 pub async fn put_object_store_bytes(uri: &str, bytes: Vec<u8>) -> Result<()> {
@@ -1017,6 +1150,51 @@ fn has_uri_scheme(uri: &str) -> bool {
     })
 }
 
+fn uri_root_for_listing(uri: &str) -> String {
+    if let Some((scheme, rest)) = uri.split_once("://") {
+        if let Some((authority, _path)) = rest.split_once('/') {
+            return format!("{scheme}://{authority}");
+        }
+    }
+    uri.trim_end_matches('/').to_string()
+}
+
+fn relative_object_path(prefix: &ObjectPath, path: &ObjectPath) -> Result<PathBuf> {
+    let prefix = prefix.to_string();
+    let path = path.to_string();
+    let prefix = prefix.trim_matches('/');
+    let path = path.trim_matches('/');
+    let prefix_with_separator = format!("{prefix}/");
+    let relative = if prefix.is_empty() {
+        path
+    } else if path == prefix {
+        path.rsplit('/').next().unwrap_or(path)
+    } else if let Some(relative) = path.strip_prefix(&prefix_with_separator) {
+        relative
+    } else {
+        path
+    };
+
+    if relative.is_empty() {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        return safe_relative_path(name);
+    }
+    safe_relative_path(relative)
+}
+
+fn safe_relative_path(relative: &str) -> Result<PathBuf> {
+    let mut path = PathBuf::new();
+    for part in relative.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(RoboticsError::InvalidArgument(format!(
+                "unsafe object path component in {relative}"
+            )));
+        }
+        path.push(part);
+    }
+    Ok(path)
+}
+
 fn path_error(err: object_store::path::Error) -> RoboticsError {
     RoboticsError::InvalidArgument(err.to_string())
 }
@@ -1305,6 +1483,57 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"cold object bytes");
         std::fs::remove_file(path).ok();
         std::fs::remove_file(source).ok();
+    }
+
+    #[tokio::test]
+    async fn object_store_get_streams_local_uri_to_file() {
+        let root =
+            std::env::temp_dir().join(format!("robotics_query_{}_object_get", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let output = root.join("staged").join("download.bin");
+        std::fs::write(&source, b"streamed object bytes").unwrap();
+
+        let bytes = get_object_store_file(&source.to_string_lossy(), &output)
+            .await
+            .unwrap();
+
+        assert_eq!(bytes, 21);
+        assert_eq!(std::fs::read(&output).unwrap(), b"streamed object bytes");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn object_store_sync_prefix_downloads_nested_local_objects() {
+        let root =
+            std::env::temp_dir().join(format!("robotics_query_{}_object_sync", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let prefix = root.join("remote").join("prefix");
+        let out = root.join("staged");
+        std::fs::create_dir_all(prefix.join("nested")).unwrap();
+        std::fs::write(prefix.join("a.bin"), b"alpha").unwrap();
+        std::fs::write(prefix.join("nested").join("b.bin"), b"bravo").unwrap();
+
+        let mut downloads = sync_object_store_prefix(&prefix.to_string_lossy(), &out, 0)
+            .await
+            .unwrap();
+        downloads.sort_by(|left, right| left.local_path.cmp(&right.local_path));
+
+        assert_eq!(downloads.len(), 2);
+        assert_eq!(
+            downloads
+                .iter()
+                .map(|item| item.downloaded_bytes)
+                .sum::<u64>(),
+            10
+        );
+        assert_eq!(std::fs::read(out.join("a.bin")).unwrap(), b"alpha");
+        assert_eq!(
+            std::fs::read(out.join("nested").join("b.bin")).unwrap(),
+            b"bravo"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
